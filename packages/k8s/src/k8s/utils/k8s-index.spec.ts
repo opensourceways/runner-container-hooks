@@ -1877,3 +1877,272 @@ describe('execPodStep', () => {
     await expect(execPodStep(['fail'], 'my-pod', 'job')).rejects.toThrow('oops')
   }, 10000)
 })
+
+// ── error code prefixes (ARC-XXX-NNN) ──────────────────────────────────────────
+
+describe('getContainerErrors — error code prefixes', () => {
+  it('prefixes ImagePullBackOff with [ARC-IMG-001]', () => {
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [waitingContainer('job', 'ImagePullBackOff')]
+    })
+    const errors = getContainerErrors(pod)
+    expect(errors[0]).toContain('[ARC-IMG-001]')
+  })
+
+  it('prefixes InvalidImageName with [ARC-IMG-002]', () => {
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [waitingContainer('job', 'InvalidImageName')]
+    })
+    const errors = getContainerErrors(pod)
+    expect(errors[0]).toContain('[ARC-IMG-002]')
+  })
+
+  it('prefixes CreateContainerConfigError with [ARC-IMG-003]', () => {
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [waitingContainer('job', 'CreateContainerConfigError')]
+    })
+    const errors = getContainerErrors(pod)
+    expect(errors[0]).toContain('[ARC-IMG-003]')
+  })
+
+  it('does not prefix unknown reasons with an error code', () => {
+    process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_WAITING_REASONS'] =
+      'WeirdCustomReason'
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [waitingContainer('job', 'WeirdCustomReason')]
+    })
+    const errors = getContainerErrors(pod)
+    expect(errors[0]).not.toMatch(/\[ARC-/)
+    delete process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_WAITING_REASONS']
+  })
+})
+
+// ── getTerminatedReasonHint — error code prefixes ────────────────────────────
+
+describe('getTerminatedReasonHint — error code prefixes', () => {
+  it('prefixes OOMKilled with [ARC-RUNTIME-001]', () => {
+    expect(getTerminatedReasonHint('OOMKilled', 137)).toContain(
+      '[ARC-RUNTIME-001]'
+    )
+  })
+
+  it('prefixes Error exit 137 with [ARC-RUNTIME-002]', () => {
+    expect(getTerminatedReasonHint('Error', 137)).toContain(
+      '[ARC-RUNTIME-002]'
+    )
+  })
+
+  it('prefixes Error exit 139 with [ARC-RUNTIME-002]', () => {
+    expect(getTerminatedReasonHint('Error', 139)).toContain(
+      '[ARC-RUNTIME-002]'
+    )
+  })
+
+  it('prefixes Error exit 126 with [ARC-RUNTIME-002]', () => {
+    expect(getTerminatedReasonHint('Error', 126)).toContain(
+      '[ARC-RUNTIME-002]'
+    )
+  })
+
+  it('prefixes Error exit 127 with [ARC-RUNTIME-002]', () => {
+    expect(getTerminatedReasonHint('Error', 127)).toContain(
+      '[ARC-RUNTIME-002]'
+    )
+  })
+
+  it('prefixes generic Error with [ARC-RUNTIME-002]', () => {
+    expect(getTerminatedReasonHint('Error', 1)).toContain(
+      '[ARC-RUNTIME-002]'
+    )
+  })
+
+  it('does not prefix FailedPostStartHookError (no error code)', () => {
+    expect(getTerminatedReasonHint('FailedPostStartHookError', 1)).not.toMatch(
+      /\[ARC-/
+    )
+  })
+
+  it('does not prefix unknown reason (fallback)', () => {
+    expect(getTerminatedReasonHint('Unknown', 1)).not.toMatch(/\[ARC-/)
+  })
+})
+
+// ── getPodEventErrors — FailedScheduling error codes + enhanced guidance ─────
+
+describe('getPodEventErrors — FailedScheduling error codes', () => {
+  let eventSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    eventSpy = vi.spyOn(k8s.CoreV1Api.prototype, 'listNamespacedEvent' as any)
+    eventSpy.mockResolvedValue(eventResult([]))
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('includes [ARC-SCHED-001] for node affinity mismatch', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent(
+          'FailedScheduling',
+          "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."
+        )
+      ])
+    )
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('[ARC-SCHED-001]')
+    expect(errors[0]).toContain('runs-on')
+  })
+
+  it('includes [ARC-SCHED-001] for node affinity mismatch (alt pattern)', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent(
+          'FailedScheduling',
+          '0/3 nodes: 3 node(s) didn\'t match node affinity.'
+        )
+      ])
+    )
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('[ARC-SCHED-001]')
+  })
+
+  it('includes [ARC-SCHED-003] for untolerated taint', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent(
+          'FailedScheduling',
+          '0/3 nodes: 3 node(s) had untolerated taint {gpu: true}.'
+        )
+      ])
+    )
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('[ARC-SCHED-003]')
+    expect(errors[0]).toContain('taint')
+  })
+
+  it('includes [ARC-VOL-001] for FailedMount', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedMount', 'Unable to mount volumes')
+      ])
+    )
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('[ARC-VOL-001]')
+  })
+
+  it('includes [ARC-VOL-002] for FailedBinding', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedBinding', 'PVC binding failed')
+      ])
+    )
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('[ARC-VOL-002]')
+  })
+
+  it('does NOT fast-fail on Insufficient NPU (transient)', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent(
+          'FailedScheduling',
+          '0/3 nodes: 3 Insufficient huawei.com/ascend-1980.'
+        )
+      ])
+    )
+    expect(await getPodEventErrors('my-pod')).toEqual([])
+  })
+
+  it('does NOT fast-fail on Insufficient cpu (transient)', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedScheduling', '0/3 nodes: 3 Insufficient cpu.')
+      ])
+    )
+    expect(await getPodEventErrors('my-pod')).toEqual([])
+  })
+})
+
+// ── describePodFailure — FailedScheduling hint appended in warning events ─────
+
+describe('describePodFailure — FailedScheduling hint in warning events', () => {
+  let readSpy: ReturnType<typeof vi.spyOn>
+  let eventSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    readSpy = vi.spyOn(k8s.CoreV1Api.prototype, 'readNamespacedPod' as any)
+    eventSpy = vi.spyOn(k8s.CoreV1Api.prototype, 'listNamespacedEvent' as any)
+    eventSpy.mockResolvedValue(eventResult([]))
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('appends [ARC-SCHED-001] hint for node affinity mismatch in warning events', async () => {
+    readSpy.mockResolvedValue(podResult(buildPod(PodPhase.PENDING)))
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent(
+          'FailedScheduling',
+          "0/3 nodes: 3 node(s) didn't match Pod's node affinity/selector."
+        )
+      ])
+    )
+    const result = await describePodFailure('my-pod')
+    expect(result).toContain('[ARC-SCHED-001]')
+    expect(result).toContain('runs-on')
+  })
+
+  it('appends [ARC-SCHED-002] hint for NPU resource shortage in warning events', async () => {
+    readSpy.mockResolvedValue(podResult(buildPod(PodPhase.PENDING)))
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent(
+          'FailedScheduling',
+          '0/3 nodes: 3 Insufficient huawei.com/ascend-1980.'
+        )
+      ])
+    )
+    const result = await describePodFailure('my-pod')
+    expect(result).toContain('[ARC-SCHED-002]')
+    expect(result).toContain('NPU')
+  })
+
+  it('appends [ARC-SCHED-003] hint for untolerated taint in warning events', async () => {
+    readSpy.mockResolvedValue(podResult(buildPod(PodPhase.PENDING)))
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent(
+          'FailedScheduling',
+          '0/3 nodes: 3 node(s) had untolerated taint {gpu: true}.'
+        )
+      ])
+    )
+    const result = await describePodFailure('my-pod')
+    expect(result).toContain('[ARC-SCHED-003]')
+    expect(result).toContain('taint')
+  })
+
+  it('does not append hint for non-FailedScheduling warning events', async () => {
+    readSpy.mockResolvedValue(podResult(buildPod(PodPhase.PENDING)))
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedMount', 'volume mount error')
+      ])
+    )
+    const result = await describePodFailure('my-pod')
+    expect(result).toContain('FailedMount')
+    expect(result).not.toContain('[ARC-') // FailedMount hint is NOT appended in warning events (only in getPodEventErrors fast-fail path)
+  })
+})

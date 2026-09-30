@@ -25,6 +25,7 @@ import {
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
 } from './utils'
+import { ERROR_CODES, formatErrorCode } from './utils/error-codes'
 import * as shlex from 'shlex'
 import { parsePositiveMsEnv, WebSocketHeartbeat } from './heartbeat'
 import type { HeartbeatWebSocket } from './heartbeat'
@@ -1147,16 +1148,16 @@ function getWaitingReasonHint(reason: string): string {
   switch (reason) {
     case 'ImagePullBackOff':
       return [
-        `  → Image pull has failed repeatedly (k8s retried with exponential backoff). Check:`,
+        `  → ${formatErrorCode(ERROR_CODES.IMG_001)} Image pull has failed repeatedly (k8s retried with exponential backoff). Check:`,
         `    - Image name and tag are correct and exist in the registry`,
         `    - If private registry: imagePullSecret is configured and credentials are valid`,
         `    - Network connectivity from the node to the registry (DNS, firewall, proxy, TLS)`,
         `    Run: kubectl describe pod <pod> | grep -A10 "Events"`
       ].join('\n')
     case 'InvalidImageName':
-      return `  → Image name is malformed. Check the workflow/job container image configuration.`
+      return `  → ${formatErrorCode(ERROR_CODES.IMG_002)} Image name is malformed. Check the workflow/job container image configuration.`
     case 'CreateContainerConfigError':
-      return `  → Container config is invalid. Check env vars, resource limits, and securityContext in the job spec.`
+      return `  → ${formatErrorCode(ERROR_CODES.IMG_003)} Container config is invalid. Check env vars, resource limits, and securityContext in the job spec.`
     default:
       return `  → Check pod events with: kubectl describe pod <pod>`
   }
@@ -1186,7 +1187,7 @@ export function getTerminatedReasonHint(
   exitCode: number | undefined
 ): string {
   if (reason === 'OOMKilled') {
-    return `  → Container exceeded its memory limit and was killed by the OOM killer.\n    Increase the memory limit in the job spec or reduce memory usage in the script.`
+    return `  → ${formatErrorCode(ERROR_CODES.RUNTIME_001)} Container exceeded its memory limit and was killed by the OOM killer.\n    Increase the memory limit in the job spec or reduce memory usage in the script.`
   }
   if (reason === 'FailedPostStartHookError') {
     return `  → The postStart lifecycle hook failed. Check the hook command and its exit code.`
@@ -1194,15 +1195,15 @@ export function getTerminatedReasonHint(
   if (reason === 'Error') {
     switch (exitCode) {
       case 137:
-        return `  → Exit code 137: process was killed (SIGKILL). Likely OOM or forceful termination.\n    Check memory usage and resource limits.`
+        return `  → ${formatErrorCode(ERROR_CODES.RUNTIME_002)} Exit code 137: process was killed (SIGKILL). Likely OOM or forceful termination.\n    Check memory usage and resource limits.`
       case 139:
-        return `  → Exit code 139: segmentation fault (SIGSEGV). The process crashed due to a memory access error.`
+        return `  → ${formatErrorCode(ERROR_CODES.RUNTIME_002)} Exit code 139: segmentation fault (SIGSEGV). The process crashed due to a memory access error.`
       case 126:
-        return `  → Exit code 126: permission denied. The script or binary is not executable.\n    Check file permissions inside the container image.`
+        return `  → ${formatErrorCode(ERROR_CODES.RUNTIME_002)} Exit code 126: permission denied. The script or binary is not executable.\n    Check file permissions inside the container image.`
       case 127:
-        return `  → Exit code 127: command not found. The script or binary does not exist in the container.\n    Check the image contents and the command/entrypoint configuration.`
+        return `  → ${formatErrorCode(ERROR_CODES.RUNTIME_002)} Exit code 127: command not found. The script or binary does not exist in the container.\n    Check the image contents and the command/entrypoint configuration.`
       default:
-        return `  → Script or process exited with a non-zero code (${exitCode ?? 'unknown'}).\n    Check the step output above for error messages.\n    Common causes: script logic errors, missing dependencies, unhandled exceptions.`
+        return `  → ${formatErrorCode(ERROR_CODES.RUNTIME_002)} Script or process exited with a non-zero code (${exitCode ?? 'unknown'}).\n    Check the step output above for error messages.\n    Common causes: script logic errors, missing dependencies, unhandled exceptions.`
     }
   }
   return `  → Check pod logs with: kubectl logs <pod> -c ${reason}`
@@ -1227,32 +1228,69 @@ export function getContainerTerminatedErrors(pod: k8s.V1Pod): string[] {
   return errors
 }
 
-function getEventReasonHint(reason: string): string {
+function getEventReasonHint(reason: string, message?: string): string {
   switch (reason) {
     case 'FailedMount':
       return [
-        `  → A volume could not be mounted. Check:`,
+        `  → ${formatErrorCode(ERROR_CODES.VOL_001)} A volume could not be mounted. Check:`,
         `    - PVC is bound (kubectl get pvc)`,
         `    - Secret/ConfigMap referenced in the volume exists`,
         `    - hostPath directories exist on the scheduled node`
       ].join('\n')
     case 'FailedBinding':
       return [
-        `  → A PVC could not be bound to a PV. Check:`,
+        `  → ${formatErrorCode(ERROR_CODES.VOL_002)} A PVC could not be bound to a PV. Check:`,
         `    - StorageClass exists and has a provisioner`,
         `    - Sufficient capacity is available`,
         `    - Access mode (ReadWriteOnce/ReadWriteMany) matches available PVs`
       ].join('\n')
     case 'FailedScheduling':
-      return [
-        `  → Pod cannot be scheduled due to a permanent configuration error. Check:`,
-        `    - nodeSelector / nodeAffinity labels match at least one node`,
-        `    - All tolerations are present for node taints`,
-        `    - PVCs referenced in the pod spec exist in the namespace`
-      ].join('\n')
+      return getFailedSchedulingHint(message)
     default:
       return `  → Check pod events with: kubectl describe pod <pod>`
   }
+}
+
+function getFailedSchedulingHint(message?: string): string {
+  const baseHint = [
+    `  → Pod cannot be scheduled due to a permanent configuration error. Check:`,
+    `    - nodeSelector / nodeAffinity labels match at least one node`,
+    `    - All tolerations are present for node taints`,
+    `    - PVCs referenced in the pod spec exist in the namespace`
+  ]
+  if (!message) {
+    return `${formatErrorCode(ERROR_CODES.SCHED_001)} ${baseHint.join('\n')}`
+  }
+  if (/node\(s\) didn't match Pod's node affinity\/selector/i.test(message) ||
+      /node\(s\) didn't match node affinity/i.test(message)) {
+    return [
+      `  → ${formatErrorCode(ERROR_CODES.SCHED_001)} Pod cannot be scheduled due to a permanent configuration error. Check:`,
+      `    - nodeSelector / nodeAffinity labels match at least one node`,
+      `    - All tolerations are present for node taints`,
+      `    - PVCs referenced in the pod spec exist in the namespace`,
+      `    → 请检查 workflow 中的 \`runs-on\` 标签是否为已部署的 runner scale set capability label（如 \`linux-aarch64-a3-2\`）。`,
+      `      可用的 capability label 见 ascend-ci-deployment 仓库 \`argocd/clusters/\` 下各集群的 scaleSetLabels 配置。`
+    ].join('\n')
+  }
+  if (/Insufficient.*huawei\.com\/ascend/i.test(message)) {
+    return [
+      `  → ${formatErrorCode(ERROR_CODES.SCHED_002)} Pod cannot be scheduled due to a permanent configuration error. Check:`,
+      `    - nodeSelector / nodeAffinity labels match at least one node`,
+      `    - All tolerations are present for node taints`,
+      `    - PVCs referenced in the pod spec exist in the namespace`,
+      `    → 当前集群该规格 NPU 资源不足，任务正在排队等待资源释放。如长时间未调度（>35min），请联系 SRE 或参考 SOP-CI-004。`
+    ].join('\n')
+  }
+  if (/node\(s\) had untolerated taint/i.test(message)) {
+    return [
+      `  → ${formatErrorCode(ERROR_CODES.SCHED_003)} Pod cannot be scheduled due to a permanent configuration error. Check:`,
+      `    - nodeSelector / nodeAffinity labels match at least one node`,
+      `    - All tolerations are present for node taints`,
+      `    - PVCs referenced in the pod spec exist in the namespace`,
+      `    → 节点 taint 导致无法调度，可能节点正在维护中。请联系 SRE 确认节点状态。`
+    ].join('\n')
+  }
+  return `${formatErrorCode(ERROR_CODES.SCHED_001)} ${baseHint.join('\n')}`
 }
 
 // Inspects the pod's Warning events for reasons in UNRECOVERABLE_EVENT_REASONS.
@@ -1316,7 +1354,7 @@ export async function getPodEventErrors(podName: string): Promise<string[]> {
     const count = e.count && e.count > 1 ? ` (x${e.count})` : ''
     const reason = `  ✗ event: ${e.reason}${count}`
     const detail = e.message ? `\n    ${e.message}` : ''
-    const hint = getEventReasonHint(e.reason)
+    const hint = getEventReasonHint(e.reason, e.message)
     errors.push(`${reason}${detail}\n${hint}`)
   }
   return errors
@@ -1440,7 +1478,14 @@ async function describePodWarningEvents(podName: string): Promise<string[]> {
   const recent = warnings.slice(-MAX_DIAGNOSTIC_EVENTS)
   const lines = recent.map(e => {
     const count = e.count && e.count > 1 ? ` (x${e.count})` : ''
-    return `  [${e.reason ?? 'Warning'}]${count} ${e.message ?? ''}`.trimEnd()
+    let line = `  [${e.reason ?? 'Warning'}]${count} ${e.message ?? ''}`.trimEnd()
+    if (e.reason === 'FailedScheduling') {
+      const hint = getEventReasonHint(e.reason, e.message)
+      if (hint) {
+        line += `\n${hint}`
+      }
+    }
+    return line
   })
   if (warnings.length > recent.length) {
     lines.unshift(
