@@ -298,3 +298,134 @@ export async function sleep(ms: number): Promise<void> {
 export function listDirAllCommand(dir: string): string {
   return `cd ${shlex.quote(dir)} && find . -type f -not -path '*/_runner_hook_responses*' -exec stat -c '%s %n' {} \\;`
 }
+
+const RETRYABLE_NETWORK_ERROR_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EPIPE',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ETIMEDOUT',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'UND_ERR_CONNECT',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_SOCKET'
+])
+
+const RETRYABLE_MESSAGE_PATTERN =
+  /ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|network timeout|timed out after/i
+
+// Transient HTTP statuses worth retrying:
+// - 401/403: an apiserver replica may briefly answer before its
+//   auth/RBAC caches are warm (observed on self-hosted k8s runners as
+//   "selfsubjectaccessreviews ... is forbidden" that succeeds on retry)
+// - 408/429/5xx: classic transient server-side conditions
+const RETRYABLE_HTTP_STATUS_CODES = new Set([
+  401, 403, 408, 429, 500, 502, 503, 504
+])
+
+export function isRetryableK8sApiError(err: unknown): boolean {
+  if (err === null || err === undefined || typeof err !== 'object') {
+    return false
+  }
+  const e = err as {
+    code?: unknown
+    cause?: { code?: unknown }
+    message?: unknown
+  }
+  if (typeof e.code === 'number') {
+    return RETRYABLE_HTTP_STATUS_CODES.has(e.code)
+  }
+  if (typeof e.code === 'string' && RETRYABLE_NETWORK_ERROR_CODES.has(e.code)) {
+    return true
+  }
+  if (e.cause && typeof e.cause.code === 'string') {
+    return RETRYABLE_NETWORK_ERROR_CODES.has(e.cause.code)
+  }
+  const message = typeof e.message === 'string' ? e.message : String(err)
+  return RETRYABLE_MESSAGE_PATTERN.test(message)
+}
+
+export interface RetryK8sApiCallOptions {
+  attempts?: number
+  baseDelayMs?: number
+  maxDelayMs?: number
+  timeoutMs?: number
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number | undefined,
+  description: string
+): Promise<T> {
+  if (!timeoutMs) {
+    return promise
+  }
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(
+        Object.assign(
+          new Error(
+            `k8s API call "${description}" timed out after ${timeoutMs} ms`
+          ),
+          {
+            code: 'ETIMEDOUT'
+          }
+        )
+      )
+    }, timeoutMs)
+    promise
+      .then(value => {
+        clearTimeout(timer)
+        resolve(value)
+      })
+      .catch(err => {
+        clearTimeout(timer)
+        reject(err)
+      })
+  })
+}
+
+/**
+ * Executes a Kubernetes API call with bounded retries and exponential backoff
+ * on transient failures (connection refused/reset/hang, or a momentary
+ * auth/RBAC 401/403 from a warming-up apiserver replica).
+ *
+ * The kubelet-to-apiserver ClusterIP path on self-hosted runner nodes opens
+ * sub-second windows whenever managed control-plane endpoints rotate; a single
+ * untimed request hitting such a window used to abort the whole workflow step.
+ * Retrying a handful of times rides through the window instead of failing.
+ */
+export async function retryK8sApiCall<T>(
+  operation: () => Promise<T>,
+  description: string,
+  options: RetryK8sApiCallOptions = {}
+): Promise<T> {
+  const attempts = options.attempts ?? 4
+  const baseDelayMs = options.baseDelayMs ?? 3000
+  const maxDelayMs = options.maxDelayMs ?? 15000
+  const timeoutMs = options.timeoutMs ?? 15000
+
+  let lastError: unknown
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await withTimeout(operation(), timeoutMs, description)
+    } catch (err) {
+      lastError = err
+      if (attempt === attempts || !isRetryableK8sApiError(err)) {
+        throw err
+      }
+      const delayMs = Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1))
+      core.warning(
+        `k8s API call "${description}" failed on attempt ${attempt}/${attempts}: ${
+          err instanceof Error ? err.message : String(err)
+        }. Retrying in ${delayMs} ms.`
+      )
+      await sleep(delayMs)
+    }
+  }
+  throw lastError
+}

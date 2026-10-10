@@ -20,6 +20,7 @@ import {
   fixArgs,
   listDirAllCommand,
   sleep,
+  retryK8sApiCall,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
@@ -1724,10 +1725,12 @@ export async function getPodStatus(
 }
 
 export async function isAuthPermissionsOK(): Promise<boolean> {
-  const sar = new k8s.V1SelfSubjectAccessReview()
   const asyncs: Promise<k8s.V1SelfSubjectAccessReview>[] = []
   for (const resource of requiredPermissions) {
     for (const verb of resource.verbs) {
+      // A fresh SAR per request: reusing a single mutable instance would let a
+      // retry re-submit the body of whichever verb the outer loop reached last.
+      const sar = new k8s.V1SelfSubjectAccessReview()
       sar.spec = new k8s.V1SelfSubjectAccessReviewSpec()
       sar.spec.resourceAttributes = new k8s.V1ResourceAttributes()
       sar.spec.resourceAttributes.verb = verb
@@ -1736,7 +1739,13 @@ export async function isAuthPermissionsOK(): Promise<boolean> {
       sar.spec.resourceAttributes.resource = resource.resource
       sar.spec.resourceAttributes.subresource = resource.subresource
       asyncs.push(
-        k8sAuthorizationV1Api.createSelfSubjectAccessReview({ body: sar })
+        retryK8sApiCall(
+          async () =>
+            k8sAuthorizationV1Api.createSelfSubjectAccessReview({ body: sar }),
+          `createSelfSubjectAccessReview(${resource.resource}${
+            resource.subresource ? '/' + resource.subresource : ''
+          },${verb})`
+        )
       )
     }
   }
