@@ -1,17 +1,19 @@
 name: Build & Push runner image
 
-# 用 runner-versions.yaml 里的每个底座版本构建自有 runner 镜像并推送到 SWR。
-# - 打 tag（v*）时：镜像 tag = <runner-version>-<git-tag>（不可变，生产引用）
-# - 推分支时：镜像 tag = <runner-version>-<branch>-<短sha>（测试/开发用，可变）
-# 底座版本升级只改 .github/runner-versions.yaml，不改 Dockerfile。
+# 手动触发：构建并推送自有 runner 镜像到 SWR。
+# 不在 push 时自动跑（省资源、避免堆镜像 tag），也不创建 git tag。
+# 触发：Actions 页面 → Run workflow，可选填 runner_version / image_tag。
 on:
-  push:
-    tags:
-      - 'v*'
-    branches:
-      - '**'
-      - '!dependabot/**'
   workflow_dispatch:
+    inputs:
+      runner_version:
+        description: 'runner base version (default: latest in .github/runner-versions.yaml)'
+        type: string
+        required: false
+      image_tag:
+        description: 'image tag (default: <runner-version>-<branch>-<shortsha>)'
+        type: string
+        required: false
 
 env:
   REGISTRY: swr.cn-southwest-2.myhuaweicloud.com
@@ -20,47 +22,40 @@ env:
 
 concurrency:
   group: build-image-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  versions:
+  resolve:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.read.outputs.matrix }}
+      runner_version: ${{ steps.r.outputs.runner_version }}
+      image_tag: ${{ steps.r.outputs.image_tag }}
     steps:
       - uses: actions/checkout@v5
-      - id: read
+      - id: r
         run: |
-          matrix=$(grep -E '^\s*-\s*"' .github/runner-versions.yaml \
-            | sed 's/.*"\(.*\)".*/\1/' | jq -R -s -c 'split("\n")[:-1]')
-          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          rv="${{ inputs.runner_version }}"
+          if [ -z "$rv" ]; then
+            rv=$(grep -E '^\s*-\s*"' .github/runner-versions.yaml \
+              | sed 's/.*"\(.*\)".*/\1/' | sort -V | tail -1)
+          fi
+          echo "runner_version=${rv}" >> "$GITHUB_OUTPUT"
+
+          it="${{ inputs.image_tag }}"
+          if [ -z "$it" ]; then
+            short=$(printf '%s' "$GITHUB_SHA" | cut -c1-6)
+            branch=$(printf '%s' "${GITHUB_REF_NAME}" | sed -E 's#[^A-Za-z0-9_.-]#-#g')
+            it="${rv}-${branch}-${short}"
+          fi
+          it="${it:0:120}"
+          echo "image_tag=${it}" >> "$GITHUB_OUTPUT"
+          echo "runner_version=${rv} image_tag=${it}"
 
   build:
-    needs: versions
+    needs: resolve
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        runner_version: ${{ fromJson(needs.versions.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v5
-
-      - name: Compute image tag
-        id: tag
-        run: |
-          short=$(printf '%s' "$GITHUB_SHA" | cut -c1-6)
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            suffix="${GITHUB_REF_NAME}"
-          else
-            # 分支名里的 / 等非法字符替换为 -，才能作为 docker tag
-            branch=$(printf '%s' "${GITHUB_REF_NAME}" | sed -E 's#[^A-Za-z0-9_.-]#-#g')
-            suffix="${branch}-${short}"
-          fi
-          tag="${{ matrix.runner_version }}-${suffix}"
-          tag="${tag:0:120}"
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "resolved tag: ${tag}"
-
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
@@ -79,8 +74,8 @@ jobs:
           push: true
           provenance: false
           build-args: |
-            RUNNER_VERSION=${{ matrix.runner_version }}
+            RUNNER_VERSION=${{ needs.resolve.outputs.runner_version }}
             BASE_REGISTRY=${{ env.BASE_REGISTRY }}
-          tags: ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
-          cache-from: type=gha,scope=${{ matrix.runner_version }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.runner_version }}
+          tags: ${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
