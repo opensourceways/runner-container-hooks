@@ -2,15 +2,42 @@
 import * as fs from 'fs'
 import * as core from '@actions/core'
 import { RunScriptStepArgs } from 'hooklib'
-import { execCpFromPod, execCpToPod, execPodStep } from '../k8s'
-import { writeRunScript, sleep, listDirAllCommand } from '../k8s/utils'
+import { execCpFromPod, execCpToPod, execPodStep, execPodStepWithOutput } from '../k8s'
+import { writeRunScript } from '../k8s/utils'
 import { JOB_CONTAINER_NAME } from './constants'
 import { dirname } from 'path'
+import * as shlex from 'shlex'
+
+function formatScriptError(exitCode: number, tailOutput: string): string {
+  const sep = '-'.repeat(60)
+  const errors = [
+    `  ✗ exit code: ${exitCode}`,
+    `  → your script exited with a non-zero code; please check your script for errors`
+  ]
+  const sections: string[] = []
+  if (tailOutput) {
+    const outputLines = tailOutput
+      .split('\n')
+      .map(l => `  ${l}`)
+      .join('\n')
+    sections.push(`Last output:\n${outputLines}`)
+  }
+  let result = `failed to run script step:\n${errors.join('\n')}`
+  if (sections.length) result += `\n${sep}\n${sections.join('\n')}`
+  return result
+}
 
 export async function runScriptStep(
   args: RunScriptStepArgs,
   state
 ): Promise<void> {
+  // Validate that pod was created successfully (prepareJob succeeded)
+  if (!state?.jobPod) {
+    throw new Error(
+      'jobPod must be set - ensure prepareJob completed successfully before running script steps'
+    )
+  }
+
   // Write the entrypoint first. This will be later coppied to the workflow pod
   const { entryPoint, entryPointArgs, environmentVariables } = args
   const { containerPath, runnerPath } = writeRunScript(
@@ -26,17 +53,40 @@ export async function runScriptStep(
   const runnerTemp = `${workdir}/_temp`
   await execCpToPod(state.jobPod, runnerTemp, containerTemp)
 
-  // Execute the entrypoint script
-  args.entryPoint = 'sh'
-  args.entryPointArgs = ['-e', containerPath]
+  // Copy GitHub directories from temp to /github
+  const setupCommands = [
+    'mkdir -p /github',
+    'cp -r /__w/_temp/_github_home /github/home',
+    'cp -r /__w/_temp/_github_workflow /github/workflow'
+  ]
+
   try {
     await execPodStep(
-      [args.entryPoint, ...args.entryPointArgs],
+      ['sh', '-c', shlex.quote(setupCommands.join(' && '))],
       state.jobPod,
       JOB_CONTAINER_NAME
     )
   } catch (err) {
+    core.debug(`Failed to copy GitHub directories: ${JSON.stringify(err)}`)
+  }
+
+  // Execute the entrypoint script
+  args.entryPoint = 'sh'
+  args.entryPointArgs = ['-e', containerPath]
+  try {
+    const { code, output } = await execPodStepWithOutput(
+      [args.entryPoint, ...args.entryPointArgs],
+      state.jobPod,
+      JOB_CONTAINER_NAME
+    )
+    if (code !== 0) {
+      throw new Error(formatScriptError(code, output))
+    }
+  } catch (err) {
     core.debug(`execPodStep failed: ${JSON.stringify(err)}`)
+    if (err instanceof Error && err.message.startsWith('failed to run script step')) {
+      throw err
+    }
     const message = (err as any)?.response?.body?.message || err
     throw new Error(`failed to run script step: ${message}`)
   } finally {
