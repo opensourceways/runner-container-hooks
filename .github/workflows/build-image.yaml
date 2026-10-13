@@ -63,8 +63,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: cn-southwest-2@${{ secrets.SWR_AK }}
-          password: ${{ secrets.SWR_LOGIN_KEY }}
+          username: cn-southwest-2@${{ secrets.SWR_USERNAME }}
+          password: ${{ secrets.SWR_PASSWORD }}
 
       - name: Build and push (linux/amd64, linux/arm64)
         uses: docker/build-push-action@v6
