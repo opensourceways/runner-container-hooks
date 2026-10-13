@@ -2,14 +2,15 @@ name: Build & Push runner image
 
 # 用 runner-versions.yaml 里的每个底座版本构建自有 runner 镜像并推送到 SWR。
 # - 打 tag（v*）时：镜像 tag = <runner-version>-<git-tag>（不可变，生产引用）
-# - 推到 main 时：镜像 tag = <runner-version>-main-<短sha>（开发验证用）
+# - 推分支时：镜像 tag = <runner-version>-<branch>-<短sha>（测试/开发用，可变）
 # 底座版本升级只改 .github/runner-versions.yaml，不改 Dockerfile。
 on:
   push:
     tags:
       - 'v*'
     branches:
-      - main
+      - '**'
+      - '!dependabot/**'
   workflow_dispatch:
 
 env:
@@ -47,12 +48,16 @@ jobs:
       - name: Compute image tag
         id: tag
         run: |
-          short=$(echo "$GITHUB_SHA" | cut -c1-6)
+          short=$(printf '%s' "$GITHUB_SHA" | cut -c1-6)
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            tag="${{ matrix.runner_version }}-${GITHUB_REF_NAME}"
+            suffix="${GITHUB_REF_NAME}"
           else
-            tag="${{ matrix.runner_version }}-${GITHUB_REF_NAME}-${short}"
+            # 分支名里的 / 等非法字符替换为 -，才能作为 docker tag
+            branch=$(printf '%s' "${GITHUB_REF_NAME}" | sed -E 's#[^A-Za-z0-9_.-]#-#g')
+            suffix="${branch}-${short}"
           fi
+          tag="${{ matrix.runner_version }}-${suffix}"
+          tag="${tag:0:120}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "resolved tag: ${tag}"
 
