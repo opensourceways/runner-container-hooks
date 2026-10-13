@@ -1,0 +1,51 @@
+name: Build runner image
+
+# 用 runner-versions.yaml 里的每个底座版本构建自有 runner 镜像。
+# 底座版本升级只改 .github/runner-versions.yaml，不改 Dockerfile。
+# 默认只构建（不推送）；配置好 registry 后取消 push 相关步骤的注释。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  versions:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.read.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: read
+        run: |
+          matrix=$(grep -E '^\s*-\s*"' .github/runner-versions.yaml \
+            | sed 's/.*"\(.*\)".*/\1/' \
+            | jq -R -s -c 'split("\n")[:-1]')
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: versions
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner_version: ${{ fromJson(needs.versions.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build image for runner ${{ matrix.runner_version }}
+        run: |
+          docker build \
+            --build-arg RUNNER_VERSION=${{ matrix.runner_version }} \
+            -t runner-container-hooks:${{ matrix.runner_version }}-${{ github.ref_name }} \
+            .
+      # - name: Log in to registry
+      #   uses: docker/login-action@v3
+      #   with:
+      #     registry: ${{ vars.REGISTRY }}
+      #     username: ${{ secrets.REGISTRY_USERNAME }}
+      #     password: ${{ secrets.REGISTRY_PASSWORD }}
+      # - name: Push image
+      #   run: |
+      #     docker tag runner-container-hooks:${{ matrix.runner_version }}-${{ github.ref_name }} \
+      #       ${{ vars.REGISTRY }}/runner:${{ matrix.runner_version }}-${{ github.ref_name }}
+      #     docker push ${{ vars.REGISTRY }}/runner:${{ matrix.runner_version }}-${{ github.ref_name }}
