@@ -20,6 +20,7 @@ import {
   fixArgs,
   listDirAllCommand,
   sleep,
+  retryK8sApiCall,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
@@ -300,7 +301,7 @@ export async function execPodStepWithOutput(
 
   // Ring buffer of the last N non-empty lines (cap to keep memory bounded).
   const buffer: string[] = []
-  const push = (line: string) => {
+  const push = (line: string): void => {
     if (line.length === 0) return
     buffer.push(line)
     if (buffer.length > tailLines) buffer.shift()
@@ -308,7 +309,7 @@ export async function execPodStepWithOutput(
 
   // Separate pending buffers per stream to prevent stdout/stderr interleaving.
   let pendingOut = ''
-  const ingestOut = (chunk: Buffer | string) => {
+  const ingestOut = (chunk: Buffer | string): void => {
     pendingOut += chunk.toString('utf8')
     const lines = pendingOut.split(/\r?\n/)
     pendingOut = lines.pop() ?? ''
@@ -316,14 +317,14 @@ export async function execPodStepWithOutput(
   }
 
   let pendingErr = ''
-  const ingestErr = (chunk: Buffer | string) => {
+  const ingestErr = (chunk: Buffer | string): void => {
     pendingErr += chunk.toString('utf8')
     const lines = pendingErr.split(/\r?\n/)
     pendingErr = lines.pop() ?? ''
     for (const line of lines) push(line)
   }
 
-  const flushPending = () => {
+  const flushPending = (): void => {
     if (pendingOut) {
       push(pendingOut)
       pendingOut = ''
@@ -682,7 +683,7 @@ export async function execCpFromPod(
             errStream,
             null,
             false,
-            async _status => {
+            async () => {
               if (errStream.size()) {
                 reject(
                   new Error(
@@ -1493,6 +1494,7 @@ async function describePodWarningEvents(podName: string): Promise<string[]> {
 // until the timeout, not terminate early. This function always returns [] as a
 // result, but is kept so checkUnrecoverableErrors compiles and the dedup logic
 // remains intact for future use.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- signature kept for callers; always returns []
 export function getPodConditionErrors(_pod: k8s.V1Pod): string[] {
   return []
 }
@@ -1610,7 +1612,7 @@ export async function waitForPodPhases(
 
     try {
       await backOffManager.backOff()
-    } catch (error) {
+    } catch {
       // BackOffManager throws "backoff timeout" when maxTimeSeconds is exceeded.
       // Don't surface that bare message: collect diagnostics first so the user
       // can see WHY the pod never became ready.
@@ -1724,10 +1726,12 @@ export async function getPodStatus(
 }
 
 export async function isAuthPermissionsOK(): Promise<boolean> {
-  const sar = new k8s.V1SelfSubjectAccessReview()
   const asyncs: Promise<k8s.V1SelfSubjectAccessReview>[] = []
   for (const resource of requiredPermissions) {
     for (const verb of resource.verbs) {
+      // A fresh SAR per request: reusing a single mutable instance would let a
+      // retry re-submit the body of whichever verb the outer loop reached last.
+      const sar = new k8s.V1SelfSubjectAccessReview()
       sar.spec = new k8s.V1SelfSubjectAccessReviewSpec()
       sar.spec.resourceAttributes = new k8s.V1ResourceAttributes()
       sar.spec.resourceAttributes.verb = verb
@@ -1736,7 +1740,13 @@ export async function isAuthPermissionsOK(): Promise<boolean> {
       sar.spec.resourceAttributes.resource = resource.resource
       sar.spec.resourceAttributes.subresource = resource.subresource
       asyncs.push(
-        k8sAuthorizationV1Api.createSelfSubjectAccessReview({ body: sar })
+        retryK8sApiCall(
+          async () =>
+            k8sAuthorizationV1Api.createSelfSubjectAccessReview({ body: sar }),
+          `createSelfSubjectAccessReview(${resource.resource}${
+            resource.subresource ? '/' + resource.subresource : ''
+          },${verb})`
+        )
       )
     }
   }
