@@ -1,4 +1,3 @@
-import * as core from '@actions/core'
 import { runScriptStep } from '../src/hooks'
 import * as k8sModule from '../src/k8s'
 import * as utils from '../src/k8s/utils'
@@ -23,10 +22,7 @@ function makeArgs(): RunScriptStepArgs {
 const state = { jobPod: 'test-job-pod' }
 
 describe('runScriptStep error classification', () => {
-  let execPodStepSpy: jest.SpyInstance
   let execPodStepWithOutputSpy: jest.SpyInstance
-  let execCpToPodSpy: jest.SpyInstance
-  let execCpFromPodSpy: jest.SpyInstance
 
   beforeEach(() => {
     process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
@@ -39,20 +35,13 @@ describe('runScriptStep error classification', () => {
       runnerPath: '/tmp/test-script.sh'
     })
 
-    execPodStepSpy = jest
-      .spyOn(k8sModule, 'execPodStep')
-      .mockResolvedValue(0)
+    jest.spyOn(k8sModule, 'execPodStep').mockResolvedValue(0)
 
-    execCpToPodSpy = jest
-      .spyOn(k8sModule, 'execCpToPod')
-      .mockResolvedValue(undefined)
+    jest.spyOn(k8sModule, 'execCpToPod').mockResolvedValue(undefined)
 
-    execCpFromPodSpy = jest
-      .spyOn(k8sModule, 'execCpFromPod')
-      .mockResolvedValue(undefined)
+    jest.spyOn(k8sModule, 'execCpFromPod').mockResolvedValue(undefined)
 
-    execPodStepWithOutputSpy = jest
-      .spyOn(k8sModule, 'execPodStepWithOutput')
+    execPodStepWithOutputSpy = jest.spyOn(k8sModule, 'execPodStepWithOutput')
   })
 
   afterEach(() => {
@@ -94,7 +83,7 @@ describe('runScriptStep error classification', () => {
     expect(caughtErr).toBeDefined()
     expect(caughtErr?.message).toContain('script output line')
     expect(caughtErr?.message).toContain('Last output:')
-    expect(caughtErr?.message).toContain('─')
+    expect(caughtErr?.message).toContain('-'.repeat(60))
   })
 
   it('throws generic error when execPodStepWithOutput rejects with non-exit error', async () => {

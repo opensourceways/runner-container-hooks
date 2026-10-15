@@ -42,9 +42,20 @@ git merge vX.Y.0        # 合并上游新版本 tag
 
 ## 自有 runner 镜像
 
-- 底座版本集中在 `.github/runner-versions.yaml`，升级 runner 只改此文件。
+由 GitHub Actions（`.github/workflows/build-image.yaml`）**手动触发**构建并推送到 SWR（替换原 Jenkins 流水线，不在 push 时自动跑，省资源）。
+
+- 入口：Actions → **Build & Push runner image** → Run workflow（可选填 `runner_version`、`image_tag`）。
+- 底座版本集中在 `.github/runner-versions.yaml`，默认取**最新版**；手动运行时可指定。
 - `Dockerfile` 通过 `--build-arg RUNNER_VERSION=<version>` 接收底座版本。
-- 镜像 tag 编码两个维度：`<runner-version>-<hooks-tag>`，例如 `2.334.0-v0.8.1-ascend.1`。
+
+镜像 tag 约定：
+
+| 场景 | 镜像 tag | 说明 |
+|---|---|---|
+| 生产 | `<runner>-vX.Y.Z-ascend.N` | 手动运行并指定 `image_tag`，不可变 |
+| 测试 | `<runner>-<branch>-<短sha>` | 不填 `image_tag` 时的默认值，可变可弃 |
+
+- 需要 secrets：`SWR_USERNAME`（含 region 前缀的完整用户名）、`SWR_PASSWORD`；镜像名与仓库见 workflow 的 `IMAGE_NAME`。
 
 ## 回滚
 
