@@ -1,16 +1,65 @@
-name: CD - Release new version
+name: CD - Release
 
+# 发版 = 在主干上打 tag 并推送。推送 v* tag 自动触发。
+# 也支持手动 dry-run：只跑校验与构建，不创建 Release。
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: run checks and build only, do not create a Release'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version and mode
+        id: meta
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          else
+            version="$(node -p "require('./package.json').version")"
+            echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+            echo "dry_run=${{ inputs.dry_run }}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "resolved version=${version}"
+
+      # 铁律1：发布 tag 必须位于主干（默认分支）历史上
+      - name: Verify tag is on default branch
+        if: ${{ github.ref_type == 'tag' }}
+        run: |
+          default_branch="${{ github.event.repository.default_branch }}"
+          git fetch origin "${default_branch}"
+          git merge-base --is-ancestor "$GITHUB_SHA" "origin/${default_branch}" \
+            || { echo "::error::tag ${GITHUB_REF_NAME} is not on ${default_branch}"; exit 1; }
+
+      # 铁律2：tag 名必须等于 package.json 版本
+      - name: Verify version matches tag
+        if: ${{ github.ref_type == 'tag' }}
+        run: |
+          pkg="$(node -p "require('./package.json').version")"
+          [ "${pkg}" = "${{ steps.meta.outputs.version }}" ] \
+            || { echo "::error::tag=${{ steps.meta.outputs.version }} but package.json=${pkg}"; exit 1; }
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
 
       - name: Install dependencies
         run: npm install
@@ -21,50 +70,42 @@ jobs:
       - name: Build packages
         run: npm run build-all
 
-      - uses: actions/github-script@v8
-        id: releaseVersion
-        with:
-          result-encoding: string
-          script: |
-            const fs = require('fs');
-            return require('./package.json').version
-
       - name: Zip up releases
         run: |
-          zip -r -j actions-runner-hooks-docker-${{ steps.releaseVersion.outputs.result }}.zip packages/docker/dist
-          zip -r -j actions-runner-hooks-k8s-${{ steps.releaseVersion.outputs.result }}.zip packages/k8s/dist
+          zip -r -j actions-runner-hooks-docker-${{ steps.meta.outputs.version }}.zip packages/docker/dist
+          zip -r -j actions-runner-hooks-k8s-${{ steps.meta.outputs.version }}.zip packages/k8s/dist
 
       - name: Calculate SHA
         id: sha
         shell: bash
         run: |
-          sha_docker=$(sha256sum actions-runner-hooks-docker-${{ steps.releaseVersion.outputs.result }}.zip | awk '{print $1}')
-          echo "Docker SHA: $sha_docker"
-          echo "docker-sha=$sha_docker" >> $GITHUB_OUTPUT
-          sha_k8s=$(sha256sum actions-runner-hooks-k8s-${{ steps.releaseVersion.outputs.result }}.zip | awk '{print $1}')
-          echo "K8s SHA: $sha_k8s"
-          echo "k8s-sha=$sha_k8s" >> $GITHUB_OUTPUT
+          docker_sha=$(sha256sum actions-runner-hooks-docker-${{ steps.meta.outputs.version }}.zip | awk '{print $1}')
+          k8s_sha=$(sha256sum actions-runner-hooks-k8s-${{ steps.meta.outputs.version }}.zip | awk '{print $1}')
+          echo "docker-sha=${docker_sha}" >> "$GITHUB_OUTPUT"
+          echo "k8s-sha=${k8s_sha}" >> "$GITHUB_OUTPUT"
 
       - name: Create release notes
+        if: ${{ steps.meta.outputs.dry_run == 'false' }}
         id: releaseNotes
         uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
-            var releaseNotes = fs.readFileSync('${{ github.workspace }}/releaseNotes.md', 'utf8').replace(/<HOOK_VERSION>/g, '${{ steps.releaseVersion.outputs.result }}')
-            releaseNotes = releaseNotes.replace(/<DOCKER_SHA>/g, '${{ steps.sha.outputs.docker-sha }}')
-            releaseNotes = releaseNotes.replace(/<K8S_SHA>/g, '${{ steps.sha.outputs.k8s-sha }}')
-            console.log(releaseNotes)
-            fs.writeFileSync('${{ github.workspace }}/finalReleaseNotes.md', releaseNotes);
+            var notes = fs.readFileSync('${{ github.workspace }}/releaseNotes.md', 'utf8')
+              .replace(/<HOOK_VERSION>/g, '${{ steps.meta.outputs.version }}')
+              .replace(/<DOCKER_SHA>/g, '${{ steps.sha.outputs.docker-sha }}')
+              .replace(/<K8S_SHA>/g, '${{ steps.sha.outputs.k8s-sha }}')
+            fs.writeFileSync('${{ github.workspace }}/finalReleaseNotes.md', notes);
 
-      - name: Create ${{ steps.releaseVersion.outputs.result }} Hook Release
+      - name: Create ${{ steps.meta.outputs.tag }} Release
+        if: ${{ steps.meta.outputs.dry_run == 'false' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v${{ steps.releaseVersion.outputs.result }} \
-            --title "v${{ steps.releaseVersion.outputs.result }}" \
-            --repo ${{ github.repository }} \
-            --notes-file ${{ github.workspace }}/finalReleaseNotes.md \
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --title "${{ steps.meta.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --notes-file "${{ github.workspace }}/finalReleaseNotes.md" \
             --latest \
-            ${{ github.workspace }}/actions-runner-hooks-k8s-${{ steps.releaseVersion.outputs.result }}.zip \
-            ${{ github.workspace }}/actions-runner-hooks-docker-${{ steps.releaseVersion.outputs.result }}.zip
+            "${{ github.workspace }}/actions-runner-hooks-k8s-${{ steps.meta.outputs.version }}.zip" \
+            "${{ github.workspace }}/actions-runner-hooks-docker-${{ steps.meta.outputs.version }}.zip"

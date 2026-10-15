@@ -142,8 +142,8 @@ export async function runContainerStep(
     }
   } catch (error) {
     try {
-      const pod = await getPodByName(podName)
-      const terminatedErrors = getContainerTerminatedErrors(pod)
+      const fetchedPod = await getPodByName(podName)
+      const terminatedErrors = getContainerTerminatedErrors(fetchedPod)
       if (terminatedErrors.length > 0) {
         const details = await describePodFailure(podName)
         core.error(
