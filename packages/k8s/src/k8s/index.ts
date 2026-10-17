@@ -125,6 +125,18 @@ export async function createJobPod(
         runAsGroup: 1001,
         runAsUser: 1001
       },
+      // resources 必须补齐且 requests==limits（CPU 为整数核），否则 job pod 会因
+      // fs-init 缺 resources 降级为 Burstable，节点 static CPU manager 绑核失效
+      resources: {
+        requests: {
+          cpu: '1',
+          memory: '256Mi'
+        },
+        limits: {
+          cpu: '1',
+          memory: '256Mi'
+        }
+      },
       volumeMounts: [
         {
           name: EXTERNALS_VOLUME_NAME,
