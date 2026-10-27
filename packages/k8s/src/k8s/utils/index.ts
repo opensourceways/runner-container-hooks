@@ -354,6 +354,16 @@ export interface RetryK8sApiCallOptions {
   baseDelayMs?: number
   maxDelayMs?: number
   timeoutMs?: number
+  /**
+   * Spread retry wake-up times across processes (equal jitter, delay x
+   * [0.5, 1.5)). Without it, every hook process that hit the same API-server
+   * stall retries at the same instant and stampedes the recovering server:
+   * observed as ~148 simultaneous access-review POSTs in one second after a
+   * 25 s control-plane hole.
+   */
+  jitter?: boolean
+  /** Injectable randomness for tests. */
+  random?: () => number
 }
 
 async function withTimeout<T>(
@@ -391,13 +401,19 @@ async function withTimeout<T>(
 
 /**
  * Executes a Kubernetes API call with bounded retries and exponential backoff
- * on transient failures (connection refused/reset/hang, or a momentary
- * auth/RBAC 401/403 from a warming-up apiserver replica).
+ * (with jitter by default) on transient failures (connection refused/reset/hang,
+ * or a momentary auth/RBAC 401/403 from a warming-up apiserver replica).
  *
  * The kubelet-to-apiserver ClusterIP path on self-hosted runner nodes opens
  * sub-second windows whenever managed control-plane endpoints rotate; a single
  * untimed request hitting such a window used to abort the whole workflow step.
  * Retrying a handful of times rides through the window instead of failing.
+ *
+ * Note: the default budget (delays 3+6+12 s ≈ 21 s) is enough for endpoint
+ * rotation blips but NOT for multi-second control-plane stalls — a 25 s
+ * all-replica apiserver stall on 2026-10-21 exceeded it. Call sites that are
+ * fatal when exhausted (the auth preflight) should pass a wider budget and/or
+ * pair it with the on-disk permission cache in ../auth-cache.
  */
 export async function retryK8sApiCall<T>(
   operation: () => Promise<T>,
@@ -408,6 +424,8 @@ export async function retryK8sApiCall<T>(
   const baseDelayMs = options.baseDelayMs ?? 3000
   const maxDelayMs = options.maxDelayMs ?? 15000
   const timeoutMs = options.timeoutMs ?? 15000
+  const jitter = options.jitter ?? true
+  const random = options.random ?? Math.random
 
   let lastError: unknown
   for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -418,7 +436,10 @@ export async function retryK8sApiCall<T>(
       if (attempt === attempts || !isRetryableK8sApiError(err)) {
         throw err
       }
-      const delayMs = Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1))
+      const backoffMs = Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1))
+      const delayMs = jitter
+        ? Math.round(backoffMs * (0.5 + random()))
+        : backoffMs
       core.warning(
         `k8s API call "${description}" failed on attempt ${attempt}/${attempts}: ${
           err instanceof Error ? err.message : String(err)
