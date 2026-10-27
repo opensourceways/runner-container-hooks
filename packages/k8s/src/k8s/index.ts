@@ -21,10 +21,18 @@ import {
   listDirAllCommand,
   sleep,
   retryK8sApiCall,
+  isRetryableK8sApiError,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
 } from './utils'
+import type { RetryK8sApiCallOptions } from './utils'
+import {
+  isFreshAuthCache,
+  isStaleAuthCacheUsable,
+  readAuthCache,
+  writeAuthCache
+} from './auth-cache'
 import * as shlex from 'shlex'
 
 const kc = new k8s.KubeConfig()
@@ -1725,33 +1733,134 @@ export async function getPodStatus(
   return pod.status
 }
 
-export async function isAuthPermissionsOK(): Promise<boolean> {
-  const asyncs: Promise<k8s.V1SelfSubjectAccessReview>[] = []
-  for (const resource of requiredPermissions) {
-    for (const verb of resource.verbs) {
-      // A fresh SAR per request: reusing a single mutable instance would let a
-      // retry re-submit the body of whichever verb the outer loop reached last.
+type AuthProbeResult =
+  | { kind: 'allowed' }
+  | { kind: 'denied' }
+  | { kind: 'inconclusive'; error: unknown }
+
+export interface AuthReviewAttributes {
+  group: string
+  resource: string
+  subresource: string
+  namespace: string
+  verb: string
+}
+
+export interface IsAuthPermissionsOKDeps {
+  /** Raw review call, injectable for tests. */
+  review?: (
+    attrs: AuthReviewAttributes
+  ) => Promise<{ status?: { allowed?: boolean } }>
+  /** Retry budget for each review; widened by default (see below). */
+  retryOptions?: RetryK8sApiCallOptions
+  now?: () => number
+}
+
+// A single review's retry budget for the preflight. #64's defaults
+// (attempts=4, delays 3/6/12 s ≈ 21 s coverage) were exhausted by a 25 s
+// all-replica apiserver stall observed on 2026-10-21 before the API recovered.
+// 6 attempts with 1.5..8 s jittered backoff cover roughly a 60 s stall of
+// fast-refused failures, and the per-job cache below removes the need for
+// every later step to depend on the API being perfectly healthy at all.
+const AUTH_PREFLIGHT_RETRY: RetryK8sApiCallOptions = {
+  attempts: 6,
+  baseDelayMs: 1500,
+  maxDelayMs: 8000
+}
+
+export async function isAuthPermissionsOK(
+  deps: IsAuthPermissionsOKDeps = {}
+): Promise<boolean> {
+  const ns = namespace()
+  const now = deps.now ?? Date.now
+  const cached = readAuthCache()
+
+  if (isFreshAuthCache(cached, ns, now())) {
+    core.debug(
+      'permission preflight answered from this job’s cache; no API call made'
+    )
+    return true
+  }
+
+  const review =
+    deps.review ??
+    (async (attrs: AuthReviewAttributes) => {
       const sar = new k8s.V1SelfSubjectAccessReview()
       sar.spec = new k8s.V1SelfSubjectAccessReviewSpec()
       sar.spec.resourceAttributes = new k8s.V1ResourceAttributes()
-      sar.spec.resourceAttributes.verb = verb
-      sar.spec.resourceAttributes.namespace = namespace()
-      sar.spec.resourceAttributes.group = resource.group
-      sar.spec.resourceAttributes.resource = resource.resource
-      sar.spec.resourceAttributes.subresource = resource.subresource
-      asyncs.push(
+      sar.spec.resourceAttributes.verb = attrs.verb
+      sar.spec.resourceAttributes.namespace = attrs.namespace
+      sar.spec.resourceAttributes.group = attrs.group
+      sar.spec.resourceAttributes.resource = attrs.resource
+      sar.spec.resourceAttributes.subresource = attrs.subresource
+      return k8sAuthorizationV1Api.createSelfSubjectAccessReview({ body: sar })
+    })
+
+  const probes: Promise<AuthProbeResult>[] = []
+  for (const resource of requiredPermissions) {
+    for (const verb of resource.verbs) {
+      const attrs: AuthReviewAttributes = {
+        group: resource.group,
+        resource: resource.resource,
+        subresource: resource.subresource,
+        namespace: ns,
+        verb
+      }
+      // A fresh SAR per request stays per-probe: reusing a single mutable
+      // instance would let a retry re-submit whichever verb the loop
+      // reached last (fixed in #64, kept here).
+      probes.push(
         retryK8sApiCall(
-          async () =>
-            k8sAuthorizationV1Api.createSelfSubjectAccessReview({ body: sar }),
+          async () => review(attrs),
           `createSelfSubjectAccessReview(${resource.resource}${
             resource.subresource ? '/' + resource.subresource : ''
-          },${verb})`
+          },${verb})`,
+          deps.retryOptions ?? AUTH_PREFLIGHT_RETRY
         )
+          .then(resp =>
+            resp.status?.allowed
+              ? { kind: 'allowed' as const }
+              : { kind: 'denied' as const }
+          )
+          .catch(async err =>
+            // Exhausted retry budget on a retryable error means we could not
+            // determine the answer — NOT that the permission is missing.
+            isRetryableK8sApiError(err)
+              ? { kind: 'inconclusive' as const, error: err }
+              : Promise.reject(err)
+          )
       )
     }
   }
-  const responses = await Promise.all(asyncs)
-  return responses.every(resp => resp.status?.allowed)
+  const results = await Promise.all(probes)
+
+  if (results.some(r => r.kind === 'denied')) {
+    // Definitive negative: do not cache, keep the legacy behavior.
+    return false
+  }
+
+  const inconclusive = results.filter(
+    (r): r is { kind: 'inconclusive'; error: unknown } =>
+      r.kind === 'inconclusive'
+  )
+  if (inconclusive.length > 0) {
+    if (isStaleAuthCacheUsable(cached, ns, now())) {
+      core.warning(
+        `permission preflight could not reach the API server (${inconclusive.length} of ${results.length} reviews undeterminable); reusing this job's successful check from ${new Date(cached?.timestamp ?? 0).toISOString()}`
+      )
+      return true
+    }
+    throw new Error(
+      `unable to verify the runner ServiceAccount permissions: ${inconclusive.length} of ${results.length} access reviews could not be completed after exhausting their retry budget. Last error: ${
+        inconclusive[0].error instanceof Error
+          ? inconclusive[0].error.message
+          : String(inconclusive[0].error)
+      }. This is NOT a permissions denial — the API server or its authorization decision chain was unreachable during the check.`
+    )
+  }
+
+  writeAuthCache({ namespace: ns, allowed: true, timestamp: now() })
+  return true
 }
 
 export async function isPodContainerAlpine(
