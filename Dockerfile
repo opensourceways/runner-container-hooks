@@ -1,4 +1,5 @@
-ARG RUNNER_VERSION
+# release 分支按版本固定默认值，避免构建时忘记传 --build-arg
+ARG RUNNER_VERSION=2.338.0
 ARG BASE_REGISTRY=ghcr.nju.edu.cn
 ARG NODE_IMAGE=swr.cn-north-4.myhuaweicloud.com/opensourceway/node:latest
 
