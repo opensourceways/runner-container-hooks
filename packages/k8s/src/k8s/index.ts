@@ -1216,6 +1216,97 @@ export function evaluateImagePullFailures(
   return errors
 }
 
+// kubelet emits a Normal "Pulling" event whenever it (re)starts an image pull
+// attempt, and pull-related Warning events when an attempt fails or kubelet
+// enters backoff. The container waiting reason cannot distinguish a retry that
+// is actively pulling from one that is merely waiting out its backoff (both
+// report ImagePullBackOff), so these events are the only reliable signal that a
+// pull is currently in flight.
+const IMAGE_PULL_STARTED_EVENT_REASON = 'Pulling'
+const IMAGE_PULL_FAILED_EVENT_REASONS = new Set([
+  'FailedPullImage',
+  'ErrImagePull',
+  'BackOffPullImage',
+  // Older kubelets report every pull failure with the generic "Failed" reason.
+  'Failed'
+])
+
+function eventTimestampMs(event: k8s.CoreV1Event): number {
+  let newest = 0
+  for (const value of [
+    event.lastTimestamp,
+    event.eventTime,
+    event.firstTimestamp
+  ]) {
+    // eventTime is a V1MicroTime, i.e. a Date subclass as well.
+    if (value instanceof Date && value.getTime() > newest) {
+      newest = value.getTime()
+    }
+  }
+  return newest
+}
+
+// Maps an event's involvedObject.fieldPath (e.g. "spec.containers{job}") back
+// to the container name. Pod-level events have no fieldPath and are ignored.
+function containerNameFromFieldPath(fieldPath?: string): string | undefined {
+  const match = fieldPath?.match(
+    /^spec\.(?:initContainers|containers)\{([^}]+)\}$/
+  )
+  return match?.[1]
+}
+
+// Returns the set of containers whose latest image pull attempt started after
+// their latest pull failure, i.e. a retry is currently in flight. Best-effort:
+// when events cannot be listed (e.g. the optional 'events' RBAC permission is
+// missing) it returns an empty set so callers keep the plain grace window.
+export async function getContainersWithImagePullInProgress(
+  podName: string
+): Promise<Set<string>> {
+  let items: k8s.CoreV1Event[]
+  try {
+    const result = await k8sApi.listNamespacedEvent({
+      namespace: namespace(),
+      fieldSelector: `involvedObject.name=${podName}`
+    })
+    items = result.items
+  } catch (err) {
+    core.debug(
+      `Could not list events for pod ${podName} during image pull grace check: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    )
+    return new Set()
+  }
+
+  const lastStart = new Map<string, number>()
+  const lastFailure = new Map<string, number>()
+  for (const event of items) {
+    const name = containerNameFromFieldPath(event.involvedObject?.fieldPath)
+    const reason = event.reason
+    if (!name || !reason) {
+      continue
+    }
+    const started = reason === IMAGE_PULL_STARTED_EVENT_REASON
+    if (!started && !IMAGE_PULL_FAILED_EVENT_REASONS.has(reason)) {
+      continue
+    }
+    const timestamp = eventTimestampMs(event)
+    if (!timestamp) {
+      continue
+    }
+    const target = started ? lastStart : lastFailure
+    target.set(name, Math.max(target.get(name) ?? 0, timestamp))
+  }
+
+  const inProgress = new Set<string>()
+  for (const [name, startedAt] of Array.from(lastStart.entries())) {
+    if (startedAt > (lastFailure.get(name) ?? 0)) {
+      inProgress.add(name)
+    }
+  }
+  return inProgress
+}
+
 export function getTerminatedReasonHint(
   reason: string,
   exitCode: number | undefined
@@ -1595,12 +1686,39 @@ export async function waitForPodPhases(
     // detected (container / event / condition) OR an image-pull failure has
     // persisted past its grace period / matched a permanent pattern. Fail fast
     // with diagnostics instead of waiting out the full timeout.
-    const imagePullErrors = evaluateImagePullFailures(
+    const now = Date.now()
+    let imagePullErrors = evaluateImagePullFailures(
       pod,
       imagePullFirstSeen,
       imagePullGraceMs,
-      Date.now()
+      now
     )
+    if (imagePullErrors.length > 0 && imagePullGraceMs > 0) {
+      // A retry that is actively pulling looks exactly like one waiting out its
+      // backoff (both report ImagePullBackOff). Before failing, restart the
+      // grace window for every container whose latest pull attempt started
+      // after its latest failure: the transfer may still be making progress,
+      // and killing the job would abort a large image that is already being
+      // pulled. The overall prepare-job timeout still bounds how long this can
+      // go on.
+      const inProgress = await getContainersWithImagePullInProgress(podName)
+      let resumed = false
+      for (const name of Array.from(inProgress)) {
+        const startedAt = imagePullFirstSeen.get(name)
+        if (startedAt !== undefined && now - startedAt >= imagePullGraceMs) {
+          imagePullFirstSeen.set(name, now)
+          resumed = true
+        }
+      }
+      if (resumed) {
+        imagePullErrors = evaluateImagePullFailures(
+          pod,
+          imagePullFirstSeen,
+          imagePullGraceMs,
+          now
+        )
+      }
+    }
     const errors = await checkUnrecoverableErrors(pod, podName)
     const allErrors = [...imagePullErrors, ...errors]
     if (allErrors.length > 0) {
