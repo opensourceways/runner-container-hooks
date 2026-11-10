@@ -53,10 +53,16 @@ rules:
     - `ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS` — how long `ImagePullBackOff`
       / `ErrImagePull` may persist before the hook fails the job (default `300`,
       i.e. 5 minutes). The pod is given this window to self-heal, e.g. during a
-      transient network outage. Permanent image errors (bad tag, invalid
-      credentials, missing repository) are detected from the waiting message and
-      still fail immediately. Set to `0` to fail as soon as the pull failure is
-      observed (the previous behavior).
+      transient network outage. When the grace period expires the hook checks
+      the pod's events: if the latest `Pulling` event is newer than the latest
+      pull failure (`FailedPullImage` / `BackOffPullImage`), a retry is still in
+      flight and the window restarts, so a large image that keeps making
+      progress is not killed mid-transfer (the overall prepare-job timeout still
+      applies). This check needs the optional `events` list permission; without
+      it the plain grace window is used. Permanent image errors (bad tag,
+      invalid credentials, missing repository) are detected from the waiting
+      message and still fail immediately. Set to `0` to fail as soon as the pull
+      failure is observed (the previous behavior).
 
 
 ## Limitations
