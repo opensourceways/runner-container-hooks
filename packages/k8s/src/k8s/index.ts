@@ -21,6 +21,7 @@ import {
   listDirAllCommand,
   sleep,
   retryK8sApiCall,
+  RetryK8sApiCallOptions,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
@@ -859,20 +860,41 @@ export async function deleteSecret(name: string): Promise<void> {
   })
 }
 
-export async function pruneSecrets(): Promise<void> {
-  const secretList = await k8sApi.listNamespacedSecret({
-    namespace: namespace(),
-    labelSelector: new RunnerInstanceLabel().toString()
-  })
+export async function pruneSecrets(
+  api: k8s.CoreV1Api = k8sApi,
+  retryOptions: RetryK8sApiCallOptions = {}
+): Promise<void> {
+  // Cleanup runs as the last step of a job and used to be a single untimed
+  // request: a transient ClusterIP/apiserver blip could hang the TCP connect
+  // for ~127s (kernel SYN retries) and fail an otherwise green job. Retry with
+  // a per-request timeout so each attempt opens a fresh connection instead of
+  // staying pinned to a dead backend by conntrack.
+  const secretList = await retryK8sApiCall(
+    async () =>
+      api.listNamespacedSecret({
+        namespace: namespace(),
+        labelSelector: new RunnerInstanceLabel().toString()
+      }),
+    'listNamespacedSecret(pruneSecrets)',
+    retryOptions
+  )
   if (!secretList.items.length) {
     return
   }
 
   await Promise.all(
-    secretList.items.map(
-      async secret =>
-        secret.metadata?.name && (await deleteSecret(secret.metadata.name))
-    )
+    secretList.items.map(async secret => {
+      const name = secret.metadata?.name
+      if (!name) {
+        return
+      }
+      await retryK8sApiCall(
+        async () =>
+          api.deleteNamespacedSecret({ name, namespace: namespace() }),
+        `deleteNamespacedSecret(${name})`,
+        retryOptions
+      )
+    })
   )
 }
 
@@ -1699,19 +1721,43 @@ export async function getPodLogs(
   await new Promise(resolve => logStream.on('end', () => resolve(null)))
 }
 
-export async function prunePods(): Promise<void> {
-  const podList = await k8sApi.listNamespacedPod({
-    namespace: namespace(),
-    labelSelector: new RunnerInstanceLabel().toString()
-  })
+export async function prunePods(
+  api: k8s.CoreV1Api = k8sApi,
+  retryOptions: RetryK8sApiCallOptions = {}
+): Promise<void> {
+  // Same rationale as pruneSecrets: cleanup must not turn a transient API blip
+  // into a failed job. Each retry is a new connection, and the per-request
+  // timeout prevents hanging on a conntrack entry pinned to a dead backend.
+  const podList = await retryK8sApiCall(
+    async () =>
+      api.listNamespacedPod({
+        namespace: namespace(),
+        labelSelector: new RunnerInstanceLabel().toString()
+      }),
+    'listNamespacedPod(prunePods)',
+    retryOptions
+  )
   if (!podList.items.length) {
     return
   }
 
   await Promise.all(
-    podList.items.map(
-      async pod => pod.metadata?.name && (await deletePod(pod.metadata.name))
-    )
+    podList.items.map(async pod => {
+      const name = pod.metadata?.name
+      if (!name) {
+        return
+      }
+      await retryK8sApiCall(
+        async () =>
+          api.deleteNamespacedPod({
+            name,
+            namespace: namespace(),
+            gracePeriodSeconds: 0
+          }),
+        `deleteNamespacedPod(${name})`,
+        retryOptions
+      )
+    })
   )
 }
 
