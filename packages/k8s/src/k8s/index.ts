@@ -21,6 +21,7 @@ import {
   listDirAllCommand,
   sleep,
   retryK8sApiCall,
+  isK8sApiNotFoundError,
   RetryK8sApiCallOptions,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
@@ -853,16 +854,14 @@ export async function createSecretForEnvs(envs: {
   return secretName
 }
 
-export async function deleteSecret(name: string): Promise<void> {
-  await k8sApi.deleteNamespacedSecret({
-    name,
-    namespace: namespace()
-  })
-}
+// The node-side blackhole observed on the HK CI nodes lasts up to ~127s (the
+// kernel SYN retry budget), which is longer than the default 4-attempt policy
+// (~81s) can ride through.
+const CLEANUP_RETRY_OPTIONS: RetryK8sApiCallOptions = { attempts: 6 }
 
 export async function pruneSecrets(
   api: k8s.CoreV1Api = k8sApi,
-  retryOptions: RetryK8sApiCallOptions = {}
+  retryOptions: RetryK8sApiCallOptions = CLEANUP_RETRY_OPTIONS
 ): Promise<void> {
   // Cleanup runs as the last step of a job and used to be a single untimed
   // request: a transient ClusterIP/apiserver blip could hang the TCP connect
@@ -893,7 +892,15 @@ export async function pruneSecrets(
           api.deleteNamespacedSecret({ name, namespace: namespace() }),
         `deleteNamespacedSecret(${name})`,
         retryOptions
-      )
+      ).catch(err => {
+        // The object may already be gone: either an earlier attempt timed out
+        // after the server applied it, or it never existed. Neither is a
+        // cleanup failure.
+        if (isK8sApiNotFoundError(err)) {
+          return
+        }
+        throw err
+      })
     })
   )
 }
@@ -1723,7 +1730,7 @@ export async function getPodLogs(
 
 export async function prunePods(
   api: k8s.CoreV1Api = k8sApi,
-  retryOptions: RetryK8sApiCallOptions = {}
+  retryOptions: RetryK8sApiCallOptions = CLEANUP_RETRY_OPTIONS
 ): Promise<void> {
   // Same rationale as pruneSecrets: cleanup must not turn a transient API blip
   // into a failed job. Each retry is a new connection, and the per-request
@@ -1756,7 +1763,14 @@ export async function prunePods(
           }),
         `deleteNamespacedPod(${name})`,
         retryOptions
-      )
+      ).catch(err => {
+        // Same as pruneSecrets: a pod that is already gone is a successful
+        // cleanup, not an error.
+        if (isK8sApiNotFoundError(err)) {
+          return
+        }
+        throw err
+      })
     })
   )
 }

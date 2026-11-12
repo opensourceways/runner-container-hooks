@@ -349,6 +349,48 @@ export function isRetryableK8sApiError(err: unknown): boolean {
   return RETRYABLE_MESSAGE_PATTERN.test(message)
 }
 
+/**
+ * True when the API server says the object does not exist. Delete calls must
+ * treat this as success: a request that timed out client-side may already have
+ * been applied server-side, so the retry legitimately observes 404.
+ */
+export function isK8sApiNotFoundError(err: unknown): boolean {
+  if (err === null || err === undefined || typeof err !== 'object') {
+    return false
+  }
+  const e = err as {
+    code?: unknown
+    statusCode?: unknown
+    body?: { code?: unknown }
+  }
+  return e.code === 404 || e.statusCode === 404 || e.body?.code === 404
+}
+
+/**
+ * Renders any thrown value into a readable log line. Plain-object errors (the
+ * shape used by mocked clients and by some fetch wrappers) would otherwise
+ * stringify to "[object Object]" and hide the cause code.
+ */
+function formatErrorForLog(err: unknown): string {
+  const e = (err ?? {}) as {
+    message?: unknown
+    code?: unknown
+    cause?: { code?: unknown }
+  }
+  const code = e.code ?? e.cause?.code
+  const message = typeof e.message === 'string' ? e.message : ''
+  if (message && code !== undefined) {
+    return `${message} (code=${String(code)})`
+  }
+  if (message) {
+    return message
+  }
+  if (code !== undefined) {
+    return `code=${String(code)}`
+  }
+  return String(err)
+}
+
 export interface RetryK8sApiCallOptions {
   attempts?: number
   baseDelayMs?: number
@@ -420,9 +462,9 @@ export async function retryK8sApiCall<T>(
       }
       const delayMs = Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1))
       core.warning(
-        `k8s API call "${description}" failed on attempt ${attempt}/${attempts}: ${
-          err instanceof Error ? err.message : String(err)
-        }. Retrying in ${delayMs} ms.`
+        `k8s API call "${description}" failed on attempt ${attempt}/${attempts}: ${formatErrorForLog(
+          err
+        )}. Retrying in ${delayMs} ms.`
       )
       await sleep(delayMs)
     }

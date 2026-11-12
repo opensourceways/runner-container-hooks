@@ -53,7 +53,7 @@ describe('cleanup API retries', () => {
     })
   })
 
-  it('does not retry a definitive pod deletion error', async () => {
+  it('treats a 404 as already deleted instead of failing the cleanup', async () => {
     const listNamespacedPod = jest
       .fn()
       .mockResolvedValue({ items: [{ metadata: { name: 'job-pod' } }] })
@@ -61,9 +61,41 @@ describe('cleanup API retries', () => {
 
     await expect(
       prunePods(fakeApi({ listNamespacedPod, deleteNamespacedPod }), fastRetry)
-    ).rejects.toEqual({ code: 404 })
+    ).resolves.toBeUndefined()
 
     expect(deleteNamespacedPod).toHaveBeenCalledTimes(1)
+  })
+
+  it('still fails on a non-retryable, non-404 delete error', async () => {
+    const listNamespacedPod = jest
+      .fn()
+      .mockResolvedValue({ items: [{ metadata: { name: 'job-pod' } }] })
+    const deleteNamespacedPod = jest.fn().mockRejectedValue({ code: 400 })
+
+    await expect(
+      prunePods(fakeApi({ listNamespacedPod, deleteNamespacedPod }), fastRetry)
+    ).rejects.toEqual({ code: 400 })
+
+    expect(deleteNamespacedPod).toHaveBeenCalledTimes(1)
+  })
+
+  it('treats a 404 after a dropped connection as success', async () => {
+    const listNamespacedSecret = jest
+      .fn()
+      .mockResolvedValue({ items: [{ metadata: { name: 'job-secret' } }] })
+    const deleteNamespacedSecret = jest
+      .fn()
+      .mockRejectedValueOnce({ code: 'ETIMEDOUT' })
+      .mockRejectedValueOnce({ code: 404 })
+
+    await expect(
+      pruneSecrets(
+        fakeApi({ listNamespacedSecret, deleteNamespacedSecret }),
+        fastRetry
+      )
+    ).resolves.toBeUndefined()
+
+    expect(deleteNamespacedSecret).toHaveBeenCalledTimes(2)
   })
 
   it('abandons a hung request and retries with a fresh connection', async () => {
