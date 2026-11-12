@@ -1,5 +1,10 @@
 import * as k8s from '@kubernetes/client-node'
-import { prunePods, pruneSecrets } from '../src/k8s'
+import {
+  createJobPod,
+  createSecretForEnvs,
+  prunePods,
+  pruneSecrets
+} from '../src/k8s'
 import { RetryK8sApiCallOptions } from '../src/k8s/utils'
 
 // Keep retries deterministic and fast: the default backoff is seconds long.
@@ -130,5 +135,110 @@ describe('cleanup API retries', () => {
       name: 'job-secret',
       namespace: 'test-ns'
     })
+  })
+})
+
+describe('create API retries', () => {
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'test-ns'
+    process.env['ACTIONS_RUNNER_POD_NAME'] = 'test-runner-pod'
+  })
+
+  it('retries a transient failure when creating a job pod', async () => {
+    const created = { metadata: { name: 'job-pod' } }
+    const createNamespacedPod = jest
+      .fn()
+      .mockRejectedValueOnce({ code: 'ETIMEDOUT' })
+      .mockResolvedValueOnce(created)
+
+    const pod = await createJobPod(
+      'job-pod',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      fakeApi({ createNamespacedPod }),
+      fastRetry
+    )
+
+    expect(createNamespacedPod).toHaveBeenCalledTimes(2)
+    expect(pod).toBe(created)
+  })
+
+  it('reads the pod back when a retried create reports AlreadyExists', async () => {
+    const existing = { metadata: { name: 'job-pod' } }
+    const createNamespacedPod = jest
+      .fn()
+      .mockRejectedValueOnce({ code: 'ETIMEDOUT' })
+      .mockRejectedValueOnce({ code: 409 })
+    const readNamespacedPod = jest.fn().mockResolvedValue(existing)
+
+    const pod = await createJobPod(
+      'job-pod',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      fakeApi({ createNamespacedPod, readNamespacedPod }),
+      fastRetry
+    )
+
+    expect(createNamespacedPod).toHaveBeenCalledTimes(2)
+    expect(readNamespacedPod).toHaveBeenCalledWith({
+      name: 'job-pod',
+      namespace: 'test-ns'
+    })
+    expect(pod).toBe(existing)
+  })
+
+  it('does not swallow a non-AlreadyExists create error', async () => {
+    const createNamespacedPod = jest.fn().mockRejectedValue({ code: 422 })
+    const readNamespacedPod = jest.fn()
+
+    await expect(
+      createJobPod(
+        'job-pod',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        fakeApi({ createNamespacedPod, readNamespacedPod }),
+        fastRetry
+      )
+    ).rejects.toEqual({ code: 422 })
+
+    expect(readNamespacedPod).not.toHaveBeenCalled()
+  })
+
+  it('retries a transient failure when creating a secret', async () => {
+    const createNamespacedSecret = jest
+      .fn()
+      .mockRejectedValueOnce({ code: 'ECONNRESET' })
+      .mockResolvedValueOnce({})
+
+    await createSecretForEnvs(
+      { FOO: 'bar' },
+      fakeApi({ createNamespacedSecret }),
+      fastRetry
+    )
+
+    expect(createNamespacedSecret).toHaveBeenCalledTimes(2)
+  })
+
+  it('reads the secret back when a retried create reports AlreadyExists', async () => {
+    const createNamespacedSecret = jest
+      .fn()
+      .mockRejectedValueOnce({ code: 'ETIMEDOUT' })
+      .mockRejectedValueOnce({ code: 409 })
+    const readNamespacedSecret = jest.fn().mockResolvedValue({})
+
+    await createSecretForEnvs(
+      { FOO: 'bar' },
+      fakeApi({ createNamespacedSecret, readNamespacedSecret }),
+      fastRetry
+    )
+
+    expect(createNamespacedSecret).toHaveBeenCalledTimes(2)
+    expect(readNamespacedSecret).toHaveBeenCalledTimes(1)
   })
 })

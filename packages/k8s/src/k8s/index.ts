@@ -22,6 +22,7 @@ import {
   sleep,
   retryK8sApiCall,
   isK8sApiNotFoundError,
+  isK8sApiAlreadyExistsError,
   RetryK8sApiCallOptions,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
@@ -38,6 +39,60 @@ const k8sBatchV1Api = kc.makeApiClient(k8s.BatchV1Api)
 const k8sAuthorizationV1Api = kc.makeApiClient(k8s.AuthorizationV1Api)
 
 const DEFAULT_WAIT_FOR_POD_TIME_SECONDS = 10 * 60 // 10 min
+
+// The node-side blackhole observed on the HK CI nodes lasts up to ~127s (the
+// kernel SYN retry budget), which is longer than the default 4-attempt policy
+// (~81s) can ride through. Both cleanup and create use this budget: they run on
+// the same ClusterIP path and both must survive the same window.
+const BLACKHOLE_RETRY_OPTIONS: RetryK8sApiCallOptions = { attempts: 6 }
+
+/**
+ * Creates a pod, treating AlreadyExists as success. A create that timed out
+ * client-side may already have been applied by the server, so the retry
+ * legitimately observes 409; reading the object back keeps the call idempotent.
+ */
+async function createPodIdempotently(
+  api: k8s.CoreV1Api,
+  body: k8s.V1Pod,
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
+): Promise<k8s.V1Pod> {
+  const name = body.metadata?.name
+  try {
+    return await retryK8sApiCall(
+      async () => api.createNamespacedPod({ namespace: namespace(), body }),
+      `createNamespacedPod(${name})`,
+      retryOptions
+    )
+  } catch (err) {
+    if (!name || !isK8sApiAlreadyExistsError(err)) {
+      throw err
+    }
+    return await api.readNamespacedPod({ name, namespace: namespace() })
+  }
+}
+
+/**
+ * Secret counterpart of createPodIdempotently.
+ */
+async function createSecretIdempotently(
+  api: k8s.CoreV1Api,
+  body: k8s.V1Secret,
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
+): Promise<k8s.V1Secret> {
+  const name = body.metadata?.name
+  try {
+    return await retryK8sApiCall(
+      async () => api.createNamespacedSecret({ namespace: namespace(), body }),
+      `createNamespacedSecret(${name})`,
+      retryOptions
+    )
+  } catch (err) {
+    if (!name || !isK8sApiAlreadyExistsError(err)) {
+      throw err
+    }
+    return await api.readNamespacedSecret({ name, namespace: namespace() })
+  }
+}
 
 export const requiredPermissions = [
   {
@@ -71,7 +126,9 @@ export async function createJobPod(
   jobContainer?: k8s.V1Container,
   services?: k8s.V1Container[],
   registry?: Registry,
-  extension?: k8s.V1PodTemplateSpec
+  extension?: k8s.V1PodTemplateSpec,
+  api: k8s.CoreV1Api = k8sApi,
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
 ): Promise<k8s.V1Pod> {
   const containers: k8s.V1Container[] = []
   if (jobContainer) {
@@ -163,7 +220,7 @@ export async function createJobPod(
   ]
 
   if (registry) {
-    const secret = await createDockerSecret(registry)
+    const secret = await createDockerSecret(registry, api, retryOptions)
     if (!secret?.metadata?.name) {
       throw new Error(`created secret does not have secret.metadata.name`)
     }
@@ -180,16 +237,15 @@ export async function createJobPod(
     mergePodSpecWithOptions(appPod.spec, extension.spec)
   }
 
-  return await k8sApi.createNamespacedPod({
-    namespace: namespace(),
-    body: appPod
-  })
+  return await createPodIdempotently(api, appPod, retryOptions)
 }
 
 export async function createContainerStepPod(
   name: string,
   container: k8s.V1Container,
-  extension?: k8s.V1PodTemplateSpec
+  extension?: k8s.V1PodTemplateSpec,
+  api: k8s.CoreV1Api = k8sApi,
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
 ): Promise<k8s.V1Pod> {
   const appPod = new k8s.V1Pod()
 
@@ -233,10 +289,7 @@ export async function createContainerStepPod(
     mergePodSpecWithOptions(appPod.spec, extension.spec)
   }
 
-  return await k8sApi.createNamespacedPod({
-    namespace: namespace(),
-    body: appPod
-  })
+  return await createPodIdempotently(api, appPod, retryOptions)
 }
 
 export async function deletePod(name: string): Promise<void> {
@@ -786,7 +839,9 @@ export async function waitForJobToComplete(jobName: string): Promise<void> {
 }
 
 export async function createDockerSecret(
-  registry: Registry
+  registry: Registry,
+  api: k8s.CoreV1Api = k8sApi,
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
 ): Promise<k8s.V1Secret> {
   const authContent = {
     auths: {
@@ -820,15 +875,16 @@ export async function createDockerSecret(
     )
   }
 
-  return await k8sApi.createNamespacedSecret({
-    namespace: namespace(),
-    body: secret
-  })
+  return await createSecretIdempotently(api, secret, retryOptions)
 }
 
-export async function createSecretForEnvs(envs: {
-  [key: string]: string
-}): Promise<string> {
+export async function createSecretForEnvs(
+  envs: {
+    [key: string]: string
+  },
+  api: k8s.CoreV1Api = k8sApi,
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
+): Promise<string> {
   const runnerInstanceLabel = new RunnerInstanceLabel()
 
   const secret = new k8s.V1Secret()
@@ -847,21 +903,13 @@ export async function createSecretForEnvs(envs: {
     secret.data[key] = Buffer.from(value).toString('base64')
   }
 
-  await k8sApi.createNamespacedSecret({
-    namespace: namespace(),
-    body: secret
-  })
+  await createSecretIdempotently(api, secret, retryOptions)
   return secretName
 }
 
-// The node-side blackhole observed on the HK CI nodes lasts up to ~127s (the
-// kernel SYN retry budget), which is longer than the default 4-attempt policy
-// (~81s) can ride through.
-const CLEANUP_RETRY_OPTIONS: RetryK8sApiCallOptions = { attempts: 6 }
-
 export async function pruneSecrets(
   api: k8s.CoreV1Api = k8sApi,
-  retryOptions: RetryK8sApiCallOptions = CLEANUP_RETRY_OPTIONS
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
 ): Promise<void> {
   // Cleanup runs as the last step of a job and used to be a single untimed
   // request: a transient ClusterIP/apiserver blip could hang the TCP connect
@@ -1730,7 +1778,7 @@ export async function getPodLogs(
 
 export async function prunePods(
   api: k8s.CoreV1Api = k8sApi,
-  retryOptions: RetryK8sApiCallOptions = CLEANUP_RETRY_OPTIONS
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
 ): Promise<void> {
   // Same rationale as pruneSecrets: cleanup must not turn a transient API blip
   // into a failed job. Each retry is a new connection, and the per-request

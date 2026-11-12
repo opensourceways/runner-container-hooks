@@ -350,11 +350,10 @@ export function isRetryableK8sApiError(err: unknown): boolean {
 }
 
 /**
- * True when the API server says the object does not exist. Delete calls must
- * treat this as success: a request that timed out client-side may already have
- * been applied server-side, so the retry legitimately observes 404.
+ * True when the API server answers with a specific HTTP status. Errors reach us
+ * in a few shapes depending on the client version and the transport.
  */
-export function isK8sApiNotFoundError(err: unknown): boolean {
+function hasK8sApiStatusCode(err: unknown, status: number): boolean {
   if (err === null || err === undefined || typeof err !== 'object') {
     return false
   }
@@ -363,7 +362,25 @@ export function isK8sApiNotFoundError(err: unknown): boolean {
     statusCode?: unknown
     body?: { code?: unknown }
   }
-  return e.code === 404 || e.statusCode === 404 || e.body?.code === 404
+  return e.code === status || e.statusCode === status || e.body?.code === status
+}
+
+/**
+ * True when the API server says the object does not exist. Delete calls must
+ * treat this as success: a request that timed out client-side may already have
+ * been applied server-side, so the retry legitimately observes 404.
+ */
+export function isK8sApiNotFoundError(err: unknown): boolean {
+  return hasK8sApiStatusCode(err, 404)
+}
+
+/**
+ * True when the API server says the object already exists. Create calls must
+ * treat this as success too: the first attempt may have been applied before its
+ * response was lost, so the retry legitimately observes 409.
+ */
+export function isK8sApiAlreadyExistsError(err: unknown): boolean {
+  return hasK8sApiStatusCode(err, 409)
 }
 
 /**
