@@ -21,6 +21,9 @@ import {
   listDirAllCommand,
   sleep,
   retryK8sApiCall,
+  isK8sApiNotFoundError,
+  isK8sApiAlreadyExistsError,
+  RetryK8sApiCallOptions,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
@@ -36,6 +39,71 @@ const k8sBatchV1Api = kc.makeApiClient(k8s.BatchV1Api)
 const k8sAuthorizationV1Api = kc.makeApiClient(k8s.AuthorizationV1Api)
 
 const DEFAULT_WAIT_FOR_POD_TIME_SECONDS = 10 * 60 // 10 min
+
+// The node-side blackhole observed on the HK CI nodes lasts up to ~127s (the
+// kernel SYN retry budget), which is longer than the default 4-attempt policy
+// (~81s) can ride through. Both cleanup and create use this budget: they run on
+// the same ClusterIP path and both must survive the same window.
+const BLACKHOLE_RETRY_OPTIONS: RetryK8sApiCallOptions = { attempts: 6 }
+
+/**
+ * Creates a pod, treating AlreadyExists as success. A create that timed out
+ * client-side may already have been applied by the server, so the retry
+ * legitimately observes 409; reading the object back keeps the call idempotent.
+ */
+async function createPodIdempotently(
+  api: k8s.CoreV1Api,
+  body: k8s.V1Pod,
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
+): Promise<k8s.V1Pod> {
+  const name = body.metadata?.name
+  try {
+    return await retryK8sApiCall(
+      async () => api.createNamespacedPod({ namespace: namespace(), body }),
+      `createNamespacedPod(${name})`,
+      retryOptions
+    )
+  } catch (err) {
+    if (!name || !isK8sApiAlreadyExistsError(err)) {
+      throw err
+    }
+    // The link may still be blackholed, so the read-back needs the same
+    // timeout and retry policy as the create itself.
+    return await retryK8sApiCall(
+      async () => api.readNamespacedPod({ name, namespace: namespace() }),
+      `readNamespacedPod(${name})`,
+      retryOptions
+    )
+  }
+}
+
+/**
+ * Secret counterpart of createPodIdempotently.
+ */
+async function createSecretIdempotently(
+  api: k8s.CoreV1Api,
+  body: k8s.V1Secret,
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
+): Promise<k8s.V1Secret> {
+  const name = body.metadata?.name
+  try {
+    return await retryK8sApiCall(
+      async () => api.createNamespacedSecret({ namespace: namespace(), body }),
+      `createNamespacedSecret(${name})`,
+      retryOptions
+    )
+  } catch (err) {
+    if (!name || !isK8sApiAlreadyExistsError(err)) {
+      throw err
+    }
+    // Same as the pod path: the read-back must not fall back to an untimed call.
+    return await retryK8sApiCall(
+      async () => api.readNamespacedSecret({ name, namespace: namespace() }),
+      `readNamespacedSecret(${name})`,
+      retryOptions
+    )
+  }
+}
 
 export const requiredPermissions = [
   {
@@ -69,7 +137,9 @@ export async function createJobPod(
   jobContainer?: k8s.V1Container,
   services?: k8s.V1Container[],
   registry?: Registry,
-  extension?: k8s.V1PodTemplateSpec
+  extension?: k8s.V1PodTemplateSpec,
+  api: k8s.CoreV1Api = k8sApi,
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
 ): Promise<k8s.V1Pod> {
   const containers: k8s.V1Container[] = []
   if (jobContainer) {
@@ -161,7 +231,7 @@ export async function createJobPod(
   ]
 
   if (registry) {
-    const secret = await createDockerSecret(registry)
+    const secret = await createDockerSecret(registry, api, retryOptions)
     if (!secret?.metadata?.name) {
       throw new Error(`created secret does not have secret.metadata.name`)
     }
@@ -178,16 +248,15 @@ export async function createJobPod(
     mergePodSpecWithOptions(appPod.spec, extension.spec)
   }
 
-  return await k8sApi.createNamespacedPod({
-    namespace: namespace(),
-    body: appPod
-  })
+  return await createPodIdempotently(api, appPod, retryOptions)
 }
 
 export async function createContainerStepPod(
   name: string,
   container: k8s.V1Container,
-  extension?: k8s.V1PodTemplateSpec
+  extension?: k8s.V1PodTemplateSpec,
+  api: k8s.CoreV1Api = k8sApi,
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
 ): Promise<k8s.V1Pod> {
   const appPod = new k8s.V1Pod()
 
@@ -231,10 +300,7 @@ export async function createContainerStepPod(
     mergePodSpecWithOptions(appPod.spec, extension.spec)
   }
 
-  return await k8sApi.createNamespacedPod({
-    namespace: namespace(),
-    body: appPod
-  })
+  return await createPodIdempotently(api, appPod, retryOptions)
 }
 
 export async function deletePod(name: string): Promise<void> {
@@ -784,7 +850,9 @@ export async function waitForJobToComplete(jobName: string): Promise<void> {
 }
 
 export async function createDockerSecret(
-  registry: Registry
+  registry: Registry,
+  api: k8s.CoreV1Api = k8sApi,
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
 ): Promise<k8s.V1Secret> {
   const authContent = {
     auths: {
@@ -818,15 +886,16 @@ export async function createDockerSecret(
     )
   }
 
-  return await k8sApi.createNamespacedSecret({
-    namespace: namespace(),
-    body: secret
-  })
+  return await createSecretIdempotently(api, secret, retryOptions)
 }
 
-export async function createSecretForEnvs(envs: {
-  [key: string]: string
-}): Promise<string> {
+export async function createSecretForEnvs(
+  envs: {
+    [key: string]: string
+  },
+  api: k8s.CoreV1Api = k8sApi,
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
+): Promise<string> {
   const runnerInstanceLabel = new RunnerInstanceLabel()
 
   const secret = new k8s.V1Secret()
@@ -845,34 +914,53 @@ export async function createSecretForEnvs(envs: {
     secret.data[key] = Buffer.from(value).toString('base64')
   }
 
-  await k8sApi.createNamespacedSecret({
-    namespace: namespace(),
-    body: secret
-  })
+  await createSecretIdempotently(api, secret, retryOptions)
   return secretName
 }
 
-export async function deleteSecret(name: string): Promise<void> {
-  await k8sApi.deleteNamespacedSecret({
-    name,
-    namespace: namespace()
-  })
-}
-
-export async function pruneSecrets(): Promise<void> {
-  const secretList = await k8sApi.listNamespacedSecret({
-    namespace: namespace(),
-    labelSelector: new RunnerInstanceLabel().toString()
-  })
+export async function pruneSecrets(
+  api: k8s.CoreV1Api = k8sApi,
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
+): Promise<void> {
+  // Cleanup runs as the last step of a job and used to be a single untimed
+  // request: a transient ClusterIP/apiserver blip could hang the TCP connect
+  // for ~127s (kernel SYN retries) and fail an otherwise green job. Retry with
+  // a per-request timeout so each attempt opens a fresh connection instead of
+  // staying pinned to a dead backend by conntrack.
+  const secretList = await retryK8sApiCall(
+    async () =>
+      api.listNamespacedSecret({
+        namespace: namespace(),
+        labelSelector: new RunnerInstanceLabel().toString()
+      }),
+    'listNamespacedSecret(pruneSecrets)',
+    retryOptions
+  )
   if (!secretList.items.length) {
     return
   }
 
   await Promise.all(
-    secretList.items.map(
-      async secret =>
-        secret.metadata?.name && (await deleteSecret(secret.metadata.name))
-    )
+    secretList.items.map(async secret => {
+      const name = secret.metadata?.name
+      if (!name) {
+        return
+      }
+      await retryK8sApiCall(
+        async () =>
+          api.deleteNamespacedSecret({ name, namespace: namespace() }),
+        `deleteNamespacedSecret(${name})`,
+        retryOptions
+      ).catch(err => {
+        // The object may already be gone: either an earlier attempt timed out
+        // after the server applied it, or it never existed. Neither is a
+        // cleanup failure.
+        if (isK8sApiNotFoundError(err)) {
+          return
+        }
+        throw err
+      })
+    })
   )
 }
 
@@ -1699,19 +1787,50 @@ export async function getPodLogs(
   await new Promise(resolve => logStream.on('end', () => resolve(null)))
 }
 
-export async function prunePods(): Promise<void> {
-  const podList = await k8sApi.listNamespacedPod({
-    namespace: namespace(),
-    labelSelector: new RunnerInstanceLabel().toString()
-  })
+export async function prunePods(
+  api: k8s.CoreV1Api = k8sApi,
+  retryOptions: RetryK8sApiCallOptions = BLACKHOLE_RETRY_OPTIONS
+): Promise<void> {
+  // Same rationale as pruneSecrets: cleanup must not turn a transient API blip
+  // into a failed job. Each retry is a new connection, and the per-request
+  // timeout prevents hanging on a conntrack entry pinned to a dead backend.
+  const podList = await retryK8sApiCall(
+    async () =>
+      api.listNamespacedPod({
+        namespace: namespace(),
+        labelSelector: new RunnerInstanceLabel().toString()
+      }),
+    'listNamespacedPod(prunePods)',
+    retryOptions
+  )
   if (!podList.items.length) {
     return
   }
 
   await Promise.all(
-    podList.items.map(
-      async pod => pod.metadata?.name && (await deletePod(pod.metadata.name))
-    )
+    podList.items.map(async pod => {
+      const name = pod.metadata?.name
+      if (!name) {
+        return
+      }
+      await retryK8sApiCall(
+        async () =>
+          api.deleteNamespacedPod({
+            name,
+            namespace: namespace(),
+            gracePeriodSeconds: 0
+          }),
+        `deleteNamespacedPod(${name})`,
+        retryOptions
+      ).catch(err => {
+        // Same as pruneSecrets: a pod that is already gone is a successful
+        // cleanup, not an error.
+        if (isK8sApiNotFoundError(err)) {
+          return
+        }
+        throw err
+      })
+    })
   )
 }
 
