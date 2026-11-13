@@ -191,6 +191,31 @@ describe('create API retries', () => {
     expect(pod).toBe(existing)
   })
 
+  it('retries the read-back when the link is still blackholed', async () => {
+    const existing = { metadata: { name: 'job-pod' } }
+    const createNamespacedPod = jest
+      .fn()
+      .mockRejectedValueOnce({ code: 'ETIMEDOUT' })
+      .mockRejectedValueOnce({ code: 409 })
+    const readNamespacedPod = jest
+      .fn()
+      .mockRejectedValueOnce({ code: 'ETIMEDOUT' })
+      .mockResolvedValueOnce(existing)
+
+    const pod = await createJobPod(
+      'job-pod',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      fakeApi({ createNamespacedPod, readNamespacedPod }),
+      fastRetry
+    )
+
+    expect(readNamespacedPod).toHaveBeenCalledTimes(2)
+    expect(pod).toBe(existing)
+  })
+
   it('does not swallow a non-AlreadyExists create error', async () => {
     const createNamespacedPod = jest.fn().mockRejectedValue({ code: 422 })
     const readNamespacedPod = jest.fn()

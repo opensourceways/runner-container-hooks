@@ -67,7 +67,13 @@ async function createPodIdempotently(
     if (!name || !isK8sApiAlreadyExistsError(err)) {
       throw err
     }
-    return await api.readNamespacedPod({ name, namespace: namespace() })
+    // The link may still be blackholed, so the read-back needs the same
+    // timeout and retry policy as the create itself.
+    return await retryK8sApiCall(
+      async () => api.readNamespacedPod({ name, namespace: namespace() }),
+      `readNamespacedPod(${name})`,
+      retryOptions
+    )
   }
 }
 
@@ -90,7 +96,12 @@ async function createSecretIdempotently(
     if (!name || !isK8sApiAlreadyExistsError(err)) {
       throw err
     }
-    return await api.readNamespacedSecret({ name, namespace: namespace() })
+    // Same as the pod path: the read-back must not fall back to an untimed call.
+    return await retryK8sApiCall(
+      async () => api.readNamespacedSecret({ name, namespace: namespace() }),
+      `readNamespacedSecret(${name})`,
+      retryOptions
+    )
   }
 }
 
