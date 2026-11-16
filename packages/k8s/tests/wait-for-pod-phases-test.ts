@@ -895,6 +895,57 @@ describe('waitForPodPhases', () => {
     )
   })
 
+  it('fails on a permanent error even when another container has a retry in flight', async () => {
+    // A permanent error must win over the in-flight graceful wait: one container
+    // can never pull successfully while another is still transferring.
+    process.env['ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS'] = '5'
+    const base = Date.UTC(2026, 0, 1, 0, 0, 0)
+    let nowMs = base
+    jest.spyOn(Date, 'now').mockImplementation(() => nowMs)
+    readSpy.mockImplementation(() => {
+      nowMs += 6000
+      return podResult(
+        buildPod(PodPhase.PENDING, {
+          containerStatuses: [
+            waitingContainer(
+              'job',
+              'ImagePullBackOff',
+              'pull access denied for nope/nonexistent, repository does not exist or may require docker login'
+            ),
+            waitingContainer(
+              'svc',
+              'ImagePullBackOff',
+              'Back-off pulling image "big:latest"'
+            )
+          ]
+        })
+      )
+    })
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('Pulling', 'Pulling image "big:latest"', {
+          type: 'Normal',
+          fieldPath: 'spec.containers{svc}',
+          lastTimestamp: new Date(base + 11000)
+        }),
+        buildEvent('FailedPullImage', 'Failed to pull image "big:latest"', {
+          fieldPath: 'spec.containers{svc}',
+          lastTimestamp: new Date(base + 5000)
+        })
+      ])
+    )
+
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).rejects.toThrow(
+      /container "job": ImagePullBackOff \(permanent image error\)/
+    )
+  })
+
   it('restarts the image-pull grace window while a retry pull is in flight', async () => {
     // Reproduces the real kubelet timeline observed on a cluster: the first
     // pull fails, then every retry keeps reporting ImagePullBackOff while the
@@ -931,6 +982,56 @@ describe('waitForPodPhases', () => {
         }),
         buildEvent('BackOffPullImage', 'Back-off pulling image "big:latest"', {
           fieldPath: 'spec.containers{job}',
+          lastTimestamp: new Date(base + 5000)
+        })
+      ])
+    )
+
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).resolves.toBeUndefined()
+  })
+
+  it('restarts the image-pull grace window for an init container retry in flight', async () => {
+    // The retry check must also map "spec.initContainers{fs-init}" field paths
+    // back to the container name, otherwise init-container pulls never resume.
+    process.env['ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS'] = '5'
+    const base = Date.UTC(2026, 0, 1, 0, 0, 0)
+    let nowMs = base
+    jest.spyOn(Date, 'now').mockImplementation(() => nowMs)
+    let reads = 0
+    readSpy.mockImplementation(() => {
+      reads++
+      nowMs += 6000
+      return reads <= 2
+        ? podResult(
+            buildPod(PodPhase.PENDING, {
+              initContainerStatuses: [
+                waitingContainer(
+                  'fs-init',
+                  'ImagePullBackOff',
+                  'Back-off pulling image "init:latest"'
+                )
+              ]
+            })
+          )
+        : podResult(buildPod(PodPhase.RUNNING))
+    })
+    // Uses the upstream kubelet reason names; the distribution-specific names
+    // (FailedPullImage / BackOffPullImage) are covered by the other tests.
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('Pulling', 'Pulling image "init:latest"', {
+          type: 'Normal',
+          fieldPath: 'spec.initContainers{fs-init}',
+          lastTimestamp: new Date(base + 11000)
+        }),
+        buildEvent('Failed', 'Failed to pull image "init:latest"', {
+          fieldPath: 'spec.initContainers{fs-init}',
           lastTimestamp: new Date(base + 5000)
         })
       ])

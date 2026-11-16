@@ -1223,12 +1223,15 @@ export function evaluateImagePullFailures(
 // report ImagePullBackOff), so these events are the only reliable signal that a
 // pull is currently in flight.
 const IMAGE_PULL_STARTED_EVENT_REASON = 'Pulling'
+// The pull-failure reason depends on the kubelet build: upstream uses the
+// pkg/kubelet/events constants ("Failed" / "BackOff" / "InspectFailed"), while
+// some distributions emit "FailedPullImage" / "BackOffPullImage". Accept both.
 const IMAGE_PULL_FAILED_EVENT_REASONS = new Set([
   'FailedPullImage',
-  'ErrImagePull',
   'BackOffPullImage',
-  // Older kubelets report every pull failure with the generic "Failed" reason.
-  'Failed'
+  'Failed',
+  'BackOff',
+  'InspectFailed'
 ])
 
 function eventTimestampMs(event: k8s.CoreV1Event): number {
