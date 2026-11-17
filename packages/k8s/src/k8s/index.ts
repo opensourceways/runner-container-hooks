@@ -1200,7 +1200,7 @@ export function evaluateImagePullFailures(
     }
     const qualifier = permanent
       ? '(permanent image error)'
-      : `(failed for ${Math.round(elapsed / 1000)}s, exceeding the ${Math.round(graceMs / 1000)}s grace period)`
+      : `(image pull failed for over ${Math.round(graceMs / 1000)}s)`
     const reason = `  ✗ container "${cs.name}": ${waiting.reason} ${qualifier}`
     const detail = message ? `\n    ${message}` : ''
     const hint = `\n${getWaitingReasonHint(waiting.reason)}`

@@ -269,7 +269,7 @@ describe('evaluateImagePullFailures', () => {
     )
     expect(errors).toHaveLength(2)
     expect(errors[0]).toContain('  ✗ container "job": ImagePullBackOff')
-    expect(errors[0]).toContain('exceeding the 300s grace period')
+    expect(errors[0]).toContain('image pull failed for over 300s')
     expect(errors[0]).toContain('→')
     expect(errors[1]).toContain('  ✗ container "svc": ErrImagePull')
   })
@@ -1087,9 +1087,7 @@ describe('waitForPodPhases', () => {
         new Set([PodPhase.RUNNING]),
         new Set([PodPhase.PENDING])
       )
-    ).rejects.toThrow(
-      /ImagePullBackOff \(failed for 6s, exceeding the 5s grace period\)/
-    )
+    ).rejects.toThrow(/ImagePullBackOff \(image pull failed for over 5s\)/)
   })
 
   it('falls back to the plain grace window when events cannot be listed', async () => {
