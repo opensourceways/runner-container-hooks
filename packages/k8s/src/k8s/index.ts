@@ -21,6 +21,8 @@ import {
   listDirAllCommand,
   sleep,
   retryK8sApiCall,
+  isExecDialError,
+  RetryK8sApiCallOptions,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
@@ -36,6 +38,47 @@ const k8sBatchV1Api = kc.makeApiClient(k8s.BatchV1Api)
 const k8sAuthorizationV1Api = kc.makeApiClient(k8s.AuthorizationV1Api)
 
 const DEFAULT_WAIT_FOR_POD_TIME_SECONDS = 10 * 60 // 10 min
+
+// Exec reaches the container through the apiserver → kubelet:10250 proxy rather
+// than the regular API path, and a step can legitimately run for minutes, so
+// retryK8sApiCall's per-request timeout does not apply here. Only failures that
+// happen while dialing kubelet are retried (see isExecDialError): at that point
+// the command never started, so re-running it cannot duplicate work.
+const EXEC_RETRY_OPTIONS: RetryK8sApiCallOptions = {
+  attempts: 3,
+  baseDelayMs: 1000,
+  maxDelayMs: 5000
+}
+
+async function retryExecCall<T>(
+  operation: () => Promise<T>,
+  description: string,
+  options: RetryK8sApiCallOptions = EXEC_RETRY_OPTIONS
+): Promise<T> {
+  const attempts = options.attempts ?? 3
+  const baseDelayMs = options.baseDelayMs ?? 1000
+  const maxDelayMs = options.maxDelayMs ?? 5000
+
+  let lastError: unknown
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await operation()
+    } catch (err) {
+      lastError = err
+      if (attempt === attempts || !isExecDialError(err)) {
+        throw err
+      }
+      const delayMs = Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1))
+      core.warning(
+        `k8s exec "${description}" could not reach the kubelet on attempt ${attempt}/${attempts}: ${
+          err instanceof Error ? err.message : String(err)
+        }. Retrying in ${delayMs} ms.`
+      )
+      await sleep(delayMs)
+    }
+  }
+  throw lastError
+}
 
 export const requiredPermissions = [
   {
@@ -249,39 +292,45 @@ export async function execPodStep(
   command: string[],
   podName: string,
   containerName: string,
-  stdin?: stream.Readable
+  stdin?: stream.Readable,
+  retryOptions: RetryK8sApiCallOptions = EXEC_RETRY_OPTIONS
 ): Promise<number> {
-  const exec = new k8s.Exec(kc)
-
-  command = fixArgs(command)
-  return await new Promise(function (resolve, reject) {
-    exec
-      .exec(
-        namespace(),
-        podName,
-        containerName,
-        command,
-        process.stdout,
-        process.stderr,
-        stdin ?? null,
-        false /* tty */,
-        resp => {
-          core.debug(`execPodStep response: ${JSON.stringify(resp)}`)
-          if (resp.status === 'Success') {
-            resolve(resp.code || 0)
-          } else {
-            core.debug(
-              JSON.stringify({
-                message: resp?.message,
-                details: resp?.details
-              })
-            )
-            reject(new Error(resp?.message || 'execPodStep failed'))
-          }
-        }
-      )
-      .catch(e => reject(e))
-  })
+  const args = fixArgs(command)
+  return await retryExecCall(
+    async () => {
+      const exec = new k8s.Exec(kc)
+      return await new Promise<number>(function (resolve, reject) {
+        exec
+          .exec(
+            namespace(),
+            podName,
+            containerName,
+            args,
+            process.stdout,
+            process.stderr,
+            stdin ?? null,
+            false /* tty */,
+            resp => {
+              core.debug(`execPodStep response: ${JSON.stringify(resp)}`)
+              if (resp.status === 'Success') {
+                resolve(resp.code || 0)
+              } else {
+                core.debug(
+                  JSON.stringify({
+                    message: resp?.message,
+                    details: resp?.details
+                  })
+                )
+                reject(new Error(resp?.message || 'execPodStep failed'))
+              }
+            }
+          )
+          .catch(e => reject(e))
+      })
+    },
+    `execPodStep(${podName}/${containerName})`,
+    retryOptions
+  )
 }
 
 // Variant of execPodStep that also captures the last `tailLines` lines of
@@ -294,10 +343,32 @@ export async function execPodStepWithOutput(
   podName: string,
   containerName: string,
   tailLines = 20,
+  stdin?: stream.Readable,
+  retryOptions: RetryK8sApiCallOptions = EXEC_RETRY_OPTIONS
+): Promise<{ code: number; output: string }> {
+  const args = fixArgs(command)
+  return await retryExecCall(
+    async () =>
+      await runExecPodStepWithOutput(
+        args,
+        podName,
+        containerName,
+        tailLines,
+        stdin
+      ),
+    `execPodStepWithOutput(${podName}/${containerName})`,
+    retryOptions
+  )
+}
+
+async function runExecPodStepWithOutput(
+  command: string[],
+  podName: string,
+  containerName: string,
+  tailLines: number,
   stdin?: stream.Readable
 ): Promise<{ code: number; output: string }> {
   const exec = new k8s.Exec(kc)
-  command = fixArgs(command)
 
   // Ring buffer of the last N non-empty lines (cap to keep memory bounded).
   const buffer: string[] = []
@@ -414,6 +485,20 @@ export async function execPodStepWithOutput(
 }
 
 export async function execCalculateOutputHashSorted(
+  podName: string,
+  containerName: string,
+  command: string[],
+  retryOptions: RetryK8sApiCallOptions = EXEC_RETRY_OPTIONS
+): Promise<{ hash: string; lines: string[] }> {
+  return await retryExecCall(
+    async () =>
+      await runExecCalculateOutputHashSorted(podName, containerName, command),
+    `execCalculateOutputHashSorted(${podName}/${containerName})`,
+    retryOptions
+  )
+}
+
+async function runExecCalculateOutputHashSorted(
   podName: string,
   containerName: string,
   command: string[]
