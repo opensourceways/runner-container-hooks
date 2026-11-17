@@ -26,11 +26,13 @@ rules:
   resources: ["secrets"]
   verbs: ["get", "list", "create", "delete"]
 ```
-- (Optional, recommended) Granting `events` read access lets the hooks attach
-  recent `Warning` events (e.g. `FailedScheduling`, `FailedMount`) to the error
-  message when a pod fails to come online. This permission is **not required** —
-  if it is missing the hooks still work, they just omit the event section from
-  diagnostics.
+- (Recommended) Granting `events` read access lets the hooks attach recent
+  `Warning` events (e.g. `FailedScheduling`, `FailedMount`) to the error message
+  when a pod fails to come online, and lets the image-pull grace check tell an
+  in-flight retry from a plain backoff (see
+  `ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS`). The hooks still work without
+  it — they omit the event section from diagnostics and fall back to the plain
+  grace window, which can abort a slow but progressing pull.
 ```
 - apiGroups: [""]
   resources: ["events"]
@@ -53,10 +55,18 @@ rules:
     - `ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS` — how long `ImagePullBackOff`
       / `ErrImagePull` may persist before the hook fails the job (default `300`,
       i.e. 5 minutes). The pod is given this window to self-heal, e.g. during a
-      transient network outage. Permanent image errors (bad tag, invalid
-      credentials, missing repository) are detected from the waiting message and
-      still fail immediately. Set to `0` to fail as soon as the pull failure is
-      observed (the previous behavior).
+      transient network outage. When the grace period expires the hook checks
+      the pod's events: if the latest `Pulling` event is newer than the latest
+      pull failure (`FailedPullImage` / `BackOffPullImage`, or
+      `Failed` / `BackOff` / `InspectFailed` depending on the kubelet build), a
+      retry is still in flight and the window restarts, so a large image that
+      keeps making progress is not killed mid-transfer (the overall
+      prepare-job timeout still applies). This check needs the recommended
+      `events` list permission; without it the plain grace window is used and a
+      slow retry is killed at the grace boundary. Permanent image errors (bad
+      tag, invalid credentials, missing repository) are detected from the
+      waiting message and still fail immediately. Set to `0` to fail as soon as
+      the pull failure is observed (the previous behavior).
 
 
 ## Limitations
