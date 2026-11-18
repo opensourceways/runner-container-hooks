@@ -349,6 +349,50 @@ export function isRetryableK8sApiError(err: unknown): boolean {
   return RETRYABLE_MESSAGE_PATTERN.test(message)
 }
 
+// Exec requests take a different path from ordinary API calls: the apiserver
+// proxies them to kubelet:10250. When the dial to kubelet never completes, the
+// command inside the container was never started, so re-running the whole exec
+// is safe. A script that did run and exited non-zero is a real failure and must
+// never be retried, otherwise the step would execute twice.
+const EXEC_DIAL_ERROR_PATTERN =
+  /dial tcp|i\/o timeout|error sending request|no route to host|EHOSTUNREACH|ENETUNREACH|UND_ERR_CONNECT|UND_ERR_CONNECT_TIMEOUT/i
+
+const EXEC_EXIT_CODE_PATTERN = /exit code[:\s]+\d+/i
+
+/**
+ * True when an exec failure happened while establishing the apiserver → kubelet
+ * connection, i.e. before the command inside the container could run.
+ */
+export function isExecDialError(err: unknown): boolean {
+  if (err === null || err === undefined) {
+    return false
+  }
+  const e = err as {
+    code?: unknown
+    cause?: { code?: unknown }
+    message?: unknown
+  }
+  const message = typeof e.message === 'string' ? e.message : String(err)
+  // A command that already produced an exit code has run to completion; its
+  // failure belongs to the script, not to the transport.
+  if (EXEC_EXIT_CODE_PATTERN.test(message)) {
+    return false
+  }
+  const codes = [e.code, e.cause?.code]
+  if (
+    codes.some(
+      code =>
+        typeof code === 'string' &&
+        /^(EHOSTUNREACH|ENETUNREACH|UND_ERR_CONNECT|UND_ERR_CONNECT_TIMEOUT)$/.test(
+          code
+        )
+    )
+  ) {
+    return true
+  }
+  return EXEC_DIAL_ERROR_PATTERN.test(message)
+}
+
 export interface RetryK8sApiCallOptions {
   attempts?: number
   baseDelayMs?: number

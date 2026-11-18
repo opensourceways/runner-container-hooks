@@ -21,11 +21,18 @@ import {
   listDirAllCommand,
   sleep,
   retryK8sApiCall,
+  isExecDialError,
+  RetryK8sApiCallOptions,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
 } from './utils'
 import * as shlex from 'shlex'
+import {
+  HeartbeatWebSocket,
+  WebSocketHeartbeat,
+  parsePositiveMsEnv
+} from './heartbeat'
 
 const kc = new k8s.KubeConfig()
 
@@ -36,6 +43,47 @@ const k8sBatchV1Api = kc.makeApiClient(k8s.BatchV1Api)
 const k8sAuthorizationV1Api = kc.makeApiClient(k8s.AuthorizationV1Api)
 
 const DEFAULT_WAIT_FOR_POD_TIME_SECONDS = 10 * 60 // 10 min
+
+// Exec reaches the container through the apiserver → kubelet:10250 proxy rather
+// than the regular API path, and a step can legitimately run for minutes, so
+// retryK8sApiCall's per-request timeout does not apply here. Only failures that
+// happen while dialing kubelet are retried (see isExecDialError): at that point
+// the command never started, so re-running it cannot duplicate work.
+const EXEC_RETRY_OPTIONS: RetryK8sApiCallOptions = {
+  attempts: 3,
+  baseDelayMs: 1000,
+  maxDelayMs: 5000
+}
+
+async function retryExecCall<T>(
+  operation: () => Promise<T>,
+  description: string,
+  options: RetryK8sApiCallOptions = EXEC_RETRY_OPTIONS
+): Promise<T> {
+  const attempts = options.attempts ?? 3
+  const baseDelayMs = options.baseDelayMs ?? 1000
+  const maxDelayMs = options.maxDelayMs ?? 5000
+
+  let lastError: unknown
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await operation()
+    } catch (err) {
+      lastError = err
+      if (attempt === attempts || !isExecDialError(err)) {
+        throw err
+      }
+      const delayMs = Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1))
+      core.warning(
+        `k8s exec "${description}" could not reach the kubelet on attempt ${attempt}/${attempts}: ${
+          err instanceof Error ? err.message : String(err)
+        }. Retrying in ${delayMs} ms.`
+      )
+      await sleep(delayMs)
+    }
+  }
+  throw lastError
+}
 
 export const requiredPermissions = [
   {
@@ -245,43 +293,142 @@ export async function deletePod(name: string): Promise<void> {
   })
 }
 
+const DEFAULT_PING_PERIOD_MS = 5000
+
+function heartbeatTiming(): { periodMs: number; deadlineMs: number } {
+  const periodMs = parsePositiveMsEnv(
+    process.env.ACTIONS_RUNNER_HEARTBEAT_PERIOD_MS,
+    DEFAULT_PING_PERIOD_MS
+  )
+  const deadlineMs = parsePositiveMsEnv(
+    process.env.ACTIONS_RUNNER_HEARTBEAT_DEADLINE_MS,
+    periodMs * 12 + 1000
+  )
+  return { periodMs, deadlineMs }
+}
+
+// A step's result is taken from the single terminal V1Status frame the API
+// server writes on the exec status channel, and client-node installs no
+// 'close' or post-open 'error' handler for the exec socket. When that exec
+// stream is torn down by an intermediary — most often an idle proxy/edge
+// timeout during a long but quiet step such as loading model weights — the
+// hook has no way to tell a real completion from a severed session: it either
+// hangs until the step timeout, or reports Success for a command that never
+// finished (a silently green step whose test cases did not run).
+//
+// attachExecGuards closes both gaps:
+//   * a keepalive ping so a quiet output window no longer looks dead to the
+//     path between the runner and the API server, and
+//   * a fail-closed handler so a socket that closes or errors *before* a
+//     genuine terminal status arrived fails the step instead of trusting it.
+//
+// The rejection messages deliberately avoid the substrings isExecDialError()
+// matches (dial tcp / i/o timeout / error sending request / ...): a session
+// that died mid-run started already, so #72's retry must NOT re-execute it.
+function attachExecGuards(
+  ws: unknown,
+  heartbeat: WebSocketHeartbeat,
+  hasTerminalStatus: () => boolean,
+  fail: (err: Error) => void
+): void {
+  const socket = ws as Partial<HeartbeatWebSocket> | undefined
+  if (
+    !socket ||
+    typeof socket.on !== 'function' ||
+    typeof socket.ping !== 'function'
+  ) {
+    // No usable socket (e.g. exec mocked in unit tests) — nothing to guard.
+    return
+  }
+  const real = socket as HeartbeatWebSocket
+  heartbeat.start(real, fail)
+  real.on('close', () => {
+    if (!hasTerminalStatus()) {
+      core.debug('[execGuards] socket closed before terminal status')
+      fail(
+        new Error(
+          'exec stream closed before the command reached a terminal state; the Kubernetes exec session was interrupted mid-run'
+        )
+      )
+    }
+  })
+  real.on('error', (err: Error) => {
+    if (!hasTerminalStatus()) {
+      core.debug(
+        `[execGuards] socket errored before terminal status: ${
+          err?.message ?? String(err)
+        }`
+      )
+      fail(
+        new Error(
+          'exec stream errored before the command reached a terminal state; the Kubernetes exec session was interrupted mid-run'
+        )
+      )
+    }
+  })
+}
+
 export async function execPodStep(
   command: string[],
   podName: string,
   containerName: string,
-  stdin?: stream.Readable
+  stdin?: stream.Readable,
+  retryOptions: RetryK8sApiCallOptions = EXEC_RETRY_OPTIONS
 ): Promise<number> {
-  const exec = new k8s.Exec(kc)
-
-  command = fixArgs(command)
-  return await new Promise(function (resolve, reject) {
-    exec
-      .exec(
-        namespace(),
-        podName,
-        containerName,
-        command,
-        process.stdout,
-        process.stderr,
-        stdin ?? null,
-        false /* tty */,
-        resp => {
-          core.debug(`execPodStep response: ${JSON.stringify(resp)}`)
-          if (resp.status === 'Success') {
-            resolve(resp.code || 0)
-          } else {
-            core.debug(
-              JSON.stringify({
-                message: resp?.message,
-                details: resp?.details
-              })
-            )
-            reject(new Error(resp?.message || 'execPodStep failed'))
-          }
+  const args = fixArgs(command)
+  return await retryExecCall(
+    async () => {
+      const exec = new k8s.Exec(kc)
+      return await new Promise<number>(function (resolve, reject) {
+        const { periodMs, deadlineMs } = heartbeatTiming()
+        const heartbeat = new WebSocketHeartbeat(periodMs, deadlineMs)
+        let terminal = false
+        let settled = false
+        const succeed = (code: number): void => {
+          if (settled) return
+          settled = true
+          heartbeat.stop()
+          resolve(code)
         }
-      )
-      .catch(e => reject(e))
-  })
+        const fail = (err: Error): void => {
+          if (settled) return
+          settled = true
+          heartbeat.stop()
+          reject(err)
+        }
+        exec
+          .exec(
+            namespace(),
+            podName,
+            containerName,
+            args,
+            process.stdout,
+            process.stderr,
+            stdin ?? null,
+            false /* tty */,
+            resp => {
+              core.debug(`execPodStep response: ${JSON.stringify(resp)}`)
+              terminal = true
+              if (resp.status === 'Success') {
+                succeed(resp.code || 0)
+              } else {
+                core.debug(
+                  JSON.stringify({
+                    message: resp?.message,
+                    details: resp?.details
+                  })
+                )
+                fail(new Error(resp?.message || 'execPodStep failed'))
+              }
+            }
+          )
+          .then(ws => attachExecGuards(ws, heartbeat, () => terminal, fail))
+          .catch(e => fail(e instanceof Error ? e : new Error(String(e))))
+      })
+    },
+    `execPodStep(${podName}/${containerName})`,
+    retryOptions
+  )
 }
 
 // Variant of execPodStep that also captures the last `tailLines` lines of
@@ -294,10 +441,32 @@ export async function execPodStepWithOutput(
   podName: string,
   containerName: string,
   tailLines = 20,
+  stdin?: stream.Readable,
+  retryOptions: RetryK8sApiCallOptions = EXEC_RETRY_OPTIONS
+): Promise<{ code: number; output: string }> {
+  const args = fixArgs(command)
+  return await retryExecCall(
+    async () =>
+      await runExecPodStepWithOutput(
+        args,
+        podName,
+        containerName,
+        tailLines,
+        stdin
+      ),
+    `execPodStepWithOutput(${podName}/${containerName})`,
+    retryOptions
+  )
+}
+
+async function runExecPodStepWithOutput(
+  command: string[],
+  podName: string,
+  containerName: string,
+  tailLines: number,
   stdin?: stream.Readable
 ): Promise<{ code: number; output: string }> {
   const exec = new k8s.Exec(kc)
-  command = fixArgs(command)
 
   // Ring buffer of the last N non-empty lines (cap to keep memory bounded).
   const buffer: string[] = []
@@ -367,6 +536,23 @@ export async function execPodStepWithOutput(
   }
 
   return await new Promise(function (resolve, reject) {
+    const { periodMs, deadlineMs } = heartbeatTiming()
+    const heartbeat = new WebSocketHeartbeat(periodMs, deadlineMs)
+    let terminal = false
+    let settled = false
+    const succeed = (code: number): void => {
+      if (settled) return
+      settled = true
+      heartbeat.stop()
+      resolve({ code, output: buffer.join('\n') })
+    }
+    const fail = (err: Error): void => {
+      if (settled) return
+      settled = true
+      heartbeat.stop()
+      reject(err)
+    }
+
     exec
       .exec(
         namespace(),
@@ -380,21 +566,23 @@ export async function execPodStepWithOutput(
         resp => {
           core.debug(`execPodStepWithOutput response: ${JSON.stringify(resp)}`)
           flushPending()
+          terminal = true
           if (resp.status === 'Success') {
-            resolve({ code: resp.code || 0, output: buffer.join('\n') })
+            succeed(resp.code || 0)
           } else {
             // k8s exec returns status='Failure' for non-zero script exit.
             // resp.code may be undefined depending on k8s version; fall back
             // to parsing the exit code from the message string.
             const code = parseExitCode(resp?.message)
             if (code !== null) {
-              resolve({ code, output: buffer.join('\n') })
+              succeed(code)
             } else {
-              reject(new Error(resp?.message || 'execPodStepWithOutput failed'))
+              fail(new Error(resp?.message || 'execPodStepWithOutput failed'))
             }
           }
         }
       )
+      .then(ws => attachExecGuards(ws, heartbeat, () => terminal, fail))
       .catch(e => {
         // In @kubernetes/client-node v1.x the promise returned by exec()
         // itself rejects for non-zero exits (the status callback may or may
@@ -405,15 +593,29 @@ export async function execPodStepWithOutput(
         const errMsg = e instanceof Error ? e.message : String(e)
         const code = parseExitCode(errMsg)
         if (code !== null) {
-          resolve({ code, output: buffer.join('\n') })
+          succeed(code)
         } else {
-          reject(e)
+          fail(e instanceof Error ? e : new Error(errMsg))
         }
       })
   })
 }
 
 export async function execCalculateOutputHashSorted(
+  podName: string,
+  containerName: string,
+  command: string[],
+  retryOptions: RetryK8sApiCallOptions = EXEC_RETRY_OPTIONS
+): Promise<{ hash: string; lines: string[] }> {
+  return await retryExecCall(
+    async () =>
+      await runExecCalculateOutputHashSorted(podName, containerName, command),
+    `execCalculateOutputHashSorted(${podName}/${containerName})`,
+    retryOptions
+  )
+}
+
+async function runExecCalculateOutputHashSorted(
   podName: string,
   containerName: string,
   command: string[]
