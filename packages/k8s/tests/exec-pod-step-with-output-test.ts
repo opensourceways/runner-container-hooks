@@ -1,5 +1,16 @@
 import * as k8s from '@kubernetes/client-node'
+import { EventEmitter } from 'events'
 import { execPodStepWithOutput } from '../src/k8s'
+
+// Stand-in for the isomorphic-ws socket client-node's exec() resolves with
+// once the connection is open.
+class FakeSocket extends EventEmitter {
+  readyState = 1
+  ping = jest.fn()
+  close = jest.fn(() => {
+    this.readyState = 3
+  })
+}
 
 jest.mock('@actions/core', () => ({
   debug: jest.fn(),
@@ -193,5 +204,60 @@ describe('execPodStepWithOutput', () => {
     // The two partial writes must NOT be merged into a single corrupted line
     expect(output).not.toContain('out partialerr partial')
     expect(output).not.toContain('err partialout partial')
+  })
+
+  it('fails the step when the exec socket closes before any terminal status', async () => {
+    // Reproduces the silently-green incident: an intermediary (idle proxy/edge
+    // timeout during a long quiet step) severs the exec stream. No Success or
+    // Failure status frame ever arrives, so the step must NOT be trusted.
+    execSpy.mockImplementation(async () => {
+      const ws = new FakeSocket()
+      setTimeout(() => ws.emit('close'), 0)
+      return ws
+    })
+    await expect(
+      execPodStepWithOutput(['sh', '-c', 'sleep 999'], 'test-pod', 'job')
+    ).rejects.toThrow(/terminal state|interrupted/)
+  })
+
+  it('does not retry (double-execute) a session that dies after it started', async () => {
+    // Complements the dial-retry work: a socket that errors MID-run must fail
+    // once, not be re-run. Even if the underlying socket error looks like a
+    // dial failure, the guard replaces it with a non-dial message.
+    let calls = 0
+    execSpy.mockImplementation(async () => {
+      calls++
+      const ws = new FakeSocket()
+      setTimeout(
+        () => ws.emit('error', new Error('read ECONNRESET ... i/o timeout')),
+        0
+      )
+      return ws
+    })
+    await expect(
+      execPodStepWithOutput(['sh', '-c', 'sleep 999'], 'test-pod', 'job')
+    ).rejects.toThrow(/terminal state|interrupted/)
+    expect(calls).toBe(1)
+  })
+
+  it('resolves on Success and is not broken by the later clean socket close', async () => {
+    // Guards against turning the fix into false failures: a real command
+    // finishes (Success), and only then does the server close the socket.
+    execSpy.mockImplementation(
+      async (_ns, _pod, _c, _cmd, stdout, _se, _si, _tty, callback) => {
+        const ws = new FakeSocket()
+        stdout.write('all done\n')
+        callback({ status: 'Success', code: 0 })
+        setTimeout(() => ws.emit('close'), 0)
+        return ws
+      }
+    )
+    const { code, output } = await execPodStepWithOutput(
+      ['cmd'],
+      'test-pod',
+      'job'
+    )
+    expect(code).toBe(0)
+    expect(output).toContain('all done')
   })
 })
