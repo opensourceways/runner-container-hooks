@@ -701,22 +701,42 @@ export async function execCpFromPod(
   containerPath: string,
   parentRunnerPath: string
 ): Promise<void> {
-  const targetRunnerPath = `${parentRunnerPath}/${path.basename(containerPath)}`
+  const basename = path.basename(containerPath)
+  const targetRunnerPath = `${parentRunnerPath}/${basename}`
   core.debug(
     `Copying from pod ${podName} ${containerPath} to ${targetRunnerPath}`
   )
 
-  // Clear target before extracting so deleted-on-pod files don't linger locally.
-  // tar.extract() appends into the destination; without this, stale files (e.g.
-  // git-credentials removed by checkout cleanup inside the pod) cause a permanent
-  // hash mismatch that no amount of retrying can resolve.
-  if (fs.existsSync(targetRunnerPath)) {
-    fs.rmSync(targetRunnerPath, { recursive: true, force: true })
-  }
+  // Extract into a staging directory next to the target and swap it in with
+  // rename() only after the transfer completed. The previous implementation
+  // deleted the target first and streamed the tar directly into its final
+  // location; while that network-bound transfer (seconds, possibly retried)
+  // was in flight, the target was missing or partially populated. The runner
+  // processes file commands from step output (e.g. `::add-matcher::`) while
+  // this sync runs and resolves the referenced files against the runner-side
+  // copy, so a partially populated target made those reads fail
+  // intermittently ("Could not find file .../mypy.json").
+  //
+  // With the staging + rename swap the target always holds a complete
+  // snapshot: the previous one until the swap, the new one after it. The swap
+  // itself is two metadata operations, which shrinks the missing-file window
+  // from the full transfer duration to sub-millisecond. Replacing the whole
+  // directory also keeps the original motivation of the clear-before-extract
+  // behavior: files deleted inside the pod (e.g. git-credentials removed by
+  // checkout cleanup) no longer linger on the runner side, so the permanent
+  // hash mismatch that motivated clearing the target cannot reappear.
+  const stagingRoot = `${parentRunnerPath}/.${basename}.incoming`
+  const stagingPath = `${stagingRoot}/${basename}`
+  const trashPath = `${parentRunnerPath}/.${basename}.trash`
 
   let attempt = 0
   while (true) {
     try {
+      // Start from a clean staging area so a retry never mixes with partial
+      // content left behind by a previous failed attempt.
+      fs.rmSync(stagingRoot, { recursive: true, force: true })
+      fs.mkdirSync(stagingRoot, { recursive: true })
+
       // make temporary directory
       const exec = new k8s.Exec(kc)
       const containerPaths = containerPath.split('/')
@@ -729,7 +749,7 @@ export async function execCpFromPod(
         containerPaths.join('/') || '/',
         dirname
       ]
-      const writerStream = tar.extract(parentRunnerPath)
+      const writerStream = tar.extract(stagingRoot)
       const errStream = new WritableStreamBuffer()
 
       await new Promise((resolve, reject) => {
@@ -766,6 +786,7 @@ export async function execCpFromPod(
       core.debug(`Attempt ${attempt + 1} failed: ${error}`)
       attempt++
       if (attempt >= 30) {
+        fs.rmSync(stagingRoot, { recursive: true, force: true })
         throw new Error(
           `execCpFromPod failed after ${attempt} attempts: ${JSON.stringify(error)}`
         )
@@ -774,6 +795,7 @@ export async function execCpFromPod(
     }
   }
 
+  let verified = false
   let attempts = 15
   const delay = 1000
   for (let i = 0; i < attempts; i++) {
@@ -789,7 +811,7 @@ export async function execCpFromPod(
         await localCalculateOutputHashSorted([
           'sh',
           '-c',
-          listDirAllCommand(targetRunnerPath)
+          listDirAllCommand(stagingPath)
         ])
 
       if (got !== want) {
@@ -797,7 +819,7 @@ export async function execCpFromPod(
           `[cpFromPod hash mismatch attempt ${i + 1}/${attempts}] want='${want}' got='${got}'`
         )
         core.debug(
-          `[cpFromPod] pod file count=${wantLines.length} runner file count=${gotLines.length}`
+          `[cpFromPod] pod file count=${wantLines.length} staging file count=${gotLines.length}`
         )
         const wantMap = new Map(
           wantLines.map(l => [l.replace(/^\d+ /, ''), l.split(' ')[0]])
@@ -818,21 +840,58 @@ export async function execCpFromPod(
           })
           .map(l => {
             const name = l.replace(/^\d+ /, '')
-            return `${name}: pod=${wantMap.get(name)} runner=${gotMap.get(name)}`
+            return `${name}: pod=${wantMap.get(name)} staging=${gotMap.get(name)}`
           })
         core.debug(`[cpFromPod] only in pod:    ${JSON.stringify(onlyInWant)}`)
-        core.debug(`[cpFromPod] only in runner: ${JSON.stringify(onlyInGot)}`)
+        core.debug(`[cpFromPod] only in staging: ${JSON.stringify(onlyInGot)}`)
         core.debug(`[cpFromPod] size mismatch:  ${JSON.stringify(sizeDiff)}`)
         await sleep(delay)
         continue
       }
 
+      verified = true
       break
     } catch (error) {
       core.debug(`Attempt ${i + 1} failed: ${error}`)
       await sleep(delay)
     }
   }
+
+  if (!verified) {
+    // The pod content may have changed while it was being read (torn
+    // snapshot). Keep the eventual-consistency semantics of the previous
+    // implementation: publish the latest staged copy and leave a warning
+    // instead of silently keeping the old snapshot forever.
+    core.warning(
+      `execCpFromPod: hash verification did not converge for ${containerPath}; publishing the latest staged copy`
+    )
+  }
+
+  if (!fs.existsSync(stagingPath)) {
+    fs.rmSync(stagingRoot, { recursive: true, force: true })
+    throw new Error(
+      `execCpFromPod: staged copy ${stagingPath} is missing; nothing to publish`
+    )
+  }
+
+  // Swap the staged snapshot into place. Staging, target and trash all live
+  // under parentRunnerPath, so every rename is a same-filesystem atomic
+  // operation. Readers see either the complete old snapshot or the complete
+  // new one; the only missing-file window is between the two renames below.
+  fs.rmSync(trashPath, { recursive: true, force: true })
+  if (fs.existsSync(targetRunnerPath)) {
+    try {
+      fs.renameSync(targetRunnerPath, trashPath)
+    } catch (error) {
+      core.debug(
+        `rename of previous target to trash failed, falling back to rm: ${JSON.stringify(error)}`
+      )
+      fs.rmSync(targetRunnerPath, { recursive: true, force: true })
+    }
+  }
+  fs.renameSync(stagingPath, targetRunnerPath)
+  fs.rmSync(stagingRoot, { recursive: true, force: true })
+  fs.rmSync(trashPath, { recursive: true, force: true })
 }
 
 export async function waitForJobToComplete(jobName: string): Promise<void> {
