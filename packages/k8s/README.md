@@ -33,6 +33,10 @@ rules:
   `ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS`). The hooks still work without
   it — they omit the event section from diagnostics and fall back to the plain
   grace window, which can abort a slow but progressing pull.
+  `FailedScheduling` events are reported in diagnostics but never trigger a fast
+  fail: the pod keeps queuing until the prepare-job timeout, because a single
+  scheduler message often mixes normal node-affinity exclusions with real
+  capacity shortages.
 ```
 - apiGroups: [""]
   resources: ["events"]
