@@ -1041,6 +1041,57 @@ export function getImagePullGraceMs(): number {
   return graceSeconds * 1000
 }
 
+export const DEFAULT_SCHEDULING_GRACE_MS = 10 * 60 * 1000 // 10 min
+
+// How long a pod may stay unschedulable (repeated FailedScheduling events)
+// before the hook gives up. Reads
+// ACTIONS_RUNNER_K8S_SCHEDULING_GRACE_SECONDS (default 600). A value of 0
+// disables the window: fail as soon as a scheduling failure is observed.
+// The prepare-job timeout remains the outer bound (see waitForPodPhases).
+export function getSchedulingGraceMs(): number {
+  const envGraceSeconds =
+    process.env['ACTIONS_RUNNER_K8S_SCHEDULING_GRACE_SECONDS']
+  if (!envGraceSeconds) {
+    return DEFAULT_SCHEDULING_GRACE_MS
+  }
+  const graceSeconds = parseInt(envGraceSeconds, 10)
+  if (Number.isNaN(graceSeconds) || graceSeconds < 0) {
+    core.warning(
+      `Scheduling grace is invalid ("${envGraceSeconds}"): use an int >= 0, falling back to ${DEFAULT_SCHEDULING_GRACE_MS / 1000}s`
+    )
+    return DEFAULT_SCHEDULING_GRACE_MS
+  }
+  return graceSeconds * 1000
+}
+
+// Start of the scheduling grace window for a pod. The pod's creationTimestamp
+// is authoritative so a hook restart or job retry never resets the clock. When
+// it is missing (or unparseable) fall back to `firstSeen`, the time the hook
+// first observed the pod: a missing timestamp must not silently skip the window.
+function schedulingWaitStartMs(
+  creationTimestamp: Date | string | undefined,
+  firstSeen: number | undefined,
+  now: number
+): number {
+  const created = creationTimestamp
+    ? new Date(creationTimestamp).getTime()
+    : Number.NaN
+  return Number.isNaN(created) ? (firstSeen ?? now) : created
+}
+
+// Returns true once a pod has been failing to schedule for `graceMs`, measured
+// from its creationTimestamp (or from `firstSeen` when that is unavailable).
+export function isSchedulingGraceElapsed(
+  creationTimestamp: Date | string | undefined,
+  now: number,
+  graceMs: number,
+  firstSeen?: number
+): boolean {
+  return (
+    now - schedulingWaitStartMs(creationTimestamp, firstSeen, now) >= graceMs
+  )
+}
+
 // Pod *event* reasons (from the event stream, not container status) that
 // indicate a permanent failure the pod will never recover from on its own.
 // These surface as Warning events on the pod (visible via `kubectl describe`)
@@ -1055,46 +1106,17 @@ export function getImagePullGraceMs(): number {
 //   - FailedBinding: a PVC could not be bound (no matching PV, storage class
 //     misconfiguration). Usually paired with FailedMount once the pod retries.
 //
-// FailedScheduling is included but gated by PERMANENT_SCHEDULING_PATTERNS:
-// only messages that positively identify a permanent configuration error
-// trigger fast-fail. Resource shortages ("Insufficient cpu/memory/gpu")
-// are silently skipped so the pod keeps queuing until the timeout.
+// FailedScheduling is gated by a grace window instead (see
+// getSchedulingGraceMs / isSchedulingGraceElapsed): it is reported only after
+// the pod has been unschedulable for longer than the window. Scheduler messages
+// routinely mix a normal "some nodes don't match the node selector" line with
+// real capacity shortages, so matching message text cannot reliably tell a
+// permanent failure from one that clears when capacity appears.
 export const UNRECOVERABLE_EVENT_REASONS = new Set([
   'FailedMount',
   'FailedBinding',
   'FailedScheduling'
 ])
-
-// Patterns that POSITIVELY IDENTIFY a permanent, unrecoverable scheduling
-// failure in a FailedScheduling event message. Fast-fail fires ONLY when
-// one of these matches. Anything else (resource shortages, unknown format,
-// absent message) is treated as transient — the pod keeps queuing.
-//
-// Permanent examples (WILL fast-fail):
-//   "0/3 nodes: 3 node(s) didn't match Pod's node affinity/selector."
-//   "0/3 nodes: 3 node(s) had untolerated taint {gpu: true}."
-//   "0/3 nodes: persistentvolumeclaim "my-pvc" not found."
-//
-// Transient examples (will NOT fast-fail, keep queuing):
-//   "0/3 nodes: 3 Insufficient nvidia.com/gpu."
-//   "0/3 nodes: 3 Insufficient memory."
-//   "0/1 nodes are available"  ← ambiguous, unknown
-//
-// Extend at runtime via env var ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS
-// (comma-separated regex strings; cannot remove built-in entries).
-export const PERMANENT_SCHEDULING_PATTERNS: readonly RegExp[] = [
-  // Node selector / affinity label mismatch — no node carries the required
-  // labels. Will not self-resolve without a pod-spec or node-label change.
-  /node\(s\) didn't match Pod's node affinity\/selector/i,
-  /node\(s\) didn't match node affinity/i,
-  // Untolerated taint — every node carries a taint the pod does not tolerate.
-  // Will not self-resolve without adding a toleration or removing the taint.
-  /node\(s\) had untolerated taint/i,
-  // PVC referenced in the pod spec does not exist in the namespace. The
-  // scheduler refuses to place the pod until the PVC is created. The workflow
-  // job spec is wrong — it won't self-resolve.
-  /persistentvolumeclaim "[^"]+" not found/i
-]
 
 export const UNRECOVERABLE_TERMINATED_REASONS = new Set([
   'OOMKilled',
@@ -1157,51 +1179,6 @@ export function getUnrecoverableTerminatedReasons(): Set<string> {
     }
   }
   return reasons
-}
-
-// Returns true when a FailedScheduling event message positively identifies a
-// permanent configuration error that will not self-resolve. Returns false
-// (treat as transient, keep queuing) for:
-//   - absent/empty messages   → unknown, assume transient
-//   - resource shortages      → Insufficient cpu/memory/gpu/etc.
-//   - any unrecognised format → unknown, assume transient
-export function isPermanentSchedulingFailure(
-  message: string | undefined
-): boolean {
-  if (!message) return false
-  return getPermanentSchedulingPatterns().some(p => p.test(message))
-}
-
-// Returns PERMANENT_SCHEDULING_PATTERNS extended by any extra patterns from
-// ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS (comma-separated regexes).
-// Invalid regex strings are skipped with a warning.
-// The compiled result is cached: env var changes during a single process are
-// rare (effectively never in a runner job), but this avoids repeated split +
-// RegExp construction on every FailedScheduling poll iteration.
-let _cachedSchedulingPatterns: readonly RegExp[] | undefined
-let _lastSchedulingPatternsEnv: string | undefined
-
-export function getPermanentSchedulingPatterns(): readonly RegExp[] {
-  const extra = process.env['ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS']
-  if (!extra) return PERMANENT_SCHEDULING_PATTERNS
-  if (_cachedSchedulingPatterns && _lastSchedulingPatternsEnv === extra) {
-    return _cachedSchedulingPatterns
-  }
-  const patterns: RegExp[] = [...PERMANENT_SCHEDULING_PATTERNS]
-  for (const raw of extra.split(',')) {
-    const trimmed = raw.trim()
-    if (!trimmed) continue
-    try {
-      patterns.push(new RegExp(trimmed, 'i'))
-    } catch {
-      core.warning(
-        `ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS: invalid regex "${trimmed}", skipped`
-      )
-    }
-  }
-  _lastSchedulingPatternsEnv = extra
-  _cachedSchedulingPatterns = patterns
-  return patterns
 }
 
 function getWaitingReasonHint(reason: string): string {
@@ -1460,27 +1437,73 @@ function getEventReasonHint(reason: string): string {
         `    - Sufficient capacity is available`,
         `    - Access mode (ReadWriteOnce/ReadWriteMany) matches available PVs`
       ].join('\n')
-    case 'FailedScheduling':
-      return [
-        `  → Pod cannot be scheduled due to a permanent configuration error. Check:`,
-        `    - nodeSelector / nodeAffinity labels match at least one node`,
-        `    - All tolerations are present for node taints`,
-        `    - PVCs referenced in the pod spec exist in the namespace`
-      ].join('\n')
     default:
       return `  → Check pod events with: kubectl describe pod <pod>`
   }
 }
 
+// Hint for a FailedScheduling error that outlived the scheduling grace window.
+function getSchedulingFailureHint(waitedSeconds: number): string {
+  return [
+    `  → Pod remained unschedulable for ${waitedSeconds}s, past the grace period. Check:`,
+    `    - Free capacity for the requested cpu / memory / accelerators`,
+    `    - nodeSelector / nodeAffinity labels match at least one node`,
+    `    - All tolerations are present for node taints`,
+    `    - PVCs referenced in the pod spec exist in the namespace`,
+    `    Run: kubectl describe pod <pod>`
+  ].join('\n')
+}
+
+// Progress log interval for a pod that is still waiting on the scheduler.
+const SCHEDULING_WAIT_LOG_INTERVAL_MS = 60 * 1000
+// One hook process drives one job pod, so a module-level timestamp is enough to
+// keep the (potentially long) scheduling wait from flooding the job log.
+let lastSchedulingWaitLogMs = 0
+
+function logSchedulingWait(
+  podName: string,
+  message: string | undefined,
+  waitedMs: number,
+  graceMs: number,
+  now: number
+): void {
+  if (now - lastSchedulingWaitLogMs < SCHEDULING_WAIT_LOG_INTERVAL_MS) {
+    return
+  }
+  lastSchedulingWaitLogMs = now
+  const waitedSeconds = Math.max(0, Math.round(waitedMs / 1000))
+  const graceSeconds = Math.round(graceMs / 1000)
+  const summary = (message ?? '(no message)').replace(/\s+/g, ' ').trim()
+  const truncated = summary.length > 240 ? `${summary.slice(0, 240)}…` : summary
+  core.info(
+    `Pod ${podName} is still waiting to be scheduled (${waitedSeconds}s of ${graceSeconds}s grace); latest scheduling message: ${truncated}`
+  )
+}
+
+// Context for the scheduling grace window. `creationTimestamp` comes from the
+// pod being waited on; `firstSeen` is the fallback used when it is absent;
+// `now`/`graceMs` let the caller reuse a single clock reading and the effective
+// (timeout-capped) window.
+export interface SchedulingGraceContext {
+  creationTimestamp?: Date | string
+  firstSeen?: number
+  now?: number
+  graceMs?: number
+}
+
 // Inspects the pod's Warning events for reasons in UNRECOVERABLE_EVENT_REASONS.
-// For FailedScheduling, only fast-fails when the message positively matches
-// a known-permanent configuration error (see PERMANENT_SCHEDULING_PATTERNS).
-// Resource shortages ("Insufficient cpu/memory/gpu") are silently skipped so
-// the pod keeps queuing until the timeout. Best-effort: if events cannot be
+// For FailedScheduling the message text is never judged directly: the failure
+// is reported only once the pod has been unschedulable for longer than the
+// scheduling grace window (measured from its creationTimestamp), so a job
+// queued behind a temporary capacity shortage keeps waiting. FailedMount and
+// FailedBinding still fail immediately. Best-effort: if events cannot be
 // listed (e.g. the optional 'events' RBAC permission is missing) it returns []
 // instead of blocking container-level fast-fail detection. Deduplicates by
 // reason so a repeatedly-retried event is reported once.
-export async function getPodEventErrors(podName: string): Promise<string[]> {
+export async function getPodEventErrors(
+  podName: string,
+  schedulingGrace: SchedulingGraceContext = {}
+): Promise<string[]> {
   const unrecoverableReasons = getUnrecoverableEventReasons()
   if (unrecoverableReasons.size === 0) {
     return []
@@ -1504,26 +1527,68 @@ export async function getPodEventErrors(podName: string): Promise<string[]> {
 
   const errors: string[] = []
   const seenReasons = new Set<string>()
+
+  // FailedScheduling is judged per pod, not per event: the grace window applies
+  // to all scheduling events alike. Repeated failures are aggregated into one
+  // event by the scheduler, so the newest one carries the current message.
+  let lastScheduling: k8s.CoreV1Event | undefined
+  for (const e of items) {
+    if (e.type !== 'Warning' || e.reason !== 'FailedScheduling') {
+      continue
+    }
+    if (
+      !lastScheduling ||
+      eventTimestampMs(e) >= eventTimestampMs(lastScheduling)
+    ) {
+      lastScheduling = e
+    }
+  }
+
+  if (unrecoverableReasons.has('FailedScheduling') && lastScheduling) {
+    const now = schedulingGrace.now ?? Date.now()
+    const graceMs = schedulingGrace.graceMs ?? getSchedulingGraceMs()
+    const startMs = schedulingWaitStartMs(
+      schedulingGrace.creationTimestamp,
+      schedulingGrace.firstSeen,
+      now
+    )
+    if (
+      !isSchedulingGraceElapsed(
+        schedulingGrace.creationTimestamp,
+        now,
+        graceMs,
+        schedulingGrace.firstSeen
+      )
+    ) {
+      logSchedulingWait(
+        podName,
+        lastScheduling.message,
+        now - startMs,
+        graceMs,
+        now
+      )
+    } else {
+      const waitedSeconds = Math.round((now - startMs) / 1000)
+      const count =
+        lastScheduling.count && lastScheduling.count > 1
+          ? ` (x${lastScheduling.count})`
+          : ''
+      const detail = lastScheduling.message
+        ? `\n    ${lastScheduling.message}`
+        : ''
+      errors.push(
+        `  ✗ event: FailedScheduling${count}${detail}\n${getSchedulingFailureHint(waitedSeconds)}`
+      )
+    }
+  }
+
   for (const e of items) {
     if (
       e.type !== 'Warning' ||
       !e.reason ||
-      !unrecoverableReasons.has(e.reason)
+      !unrecoverableReasons.has(e.reason) ||
+      e.reason === 'FailedScheduling'
     ) {
-      continue
-    }
-    // FailedScheduling: only fast-fail when the message positively matches a
-    // known-permanent config error. Resource shortages and unknown messages
-    // are treated as transient — let the pod keep queuing.
-    if (
-      e.reason === 'FailedScheduling' &&
-      !isPermanentSchedulingFailure(e.message)
-    ) {
-      core.debug(
-        `[fast-fail] Skipping FailedScheduling (not a recognised permanent error): ${
-          e.message ?? '(no message)'
-        }`
-      )
       continue
     }
     if (seenReasons.has(e.reason)) {
@@ -1670,12 +1735,11 @@ async function describePodWarningEvents(podName: string): Promise<string[]> {
   return lines
 }
 
-// Inspects the pod's status.conditions for scheduling failures. FailedScheduling
-// is intentionally excluded from fast-fail detection (see UNRECOVERABLE_EVENT_REASONS
-// comment) — scheduling failures are transient resource waits that should queue
-// until the timeout, not terminate early. This function always returns [] as a
-// result, but is kept so checkUnrecoverableErrors compiles and the dedup logic
-// remains intact for future use.
+// Inspects the pod's status.conditions for scheduling failures. Scheduling
+// failures are handled from pod events only (after the scheduling grace window,
+// see getPodEventErrors), so this always returns []. Kept so
+// checkUnrecoverableErrors compiles and the dedup logic remains intact for
+// future use.
 // eslint-disable-next-line @typescript-eslint/no-unused-vars -- signature kept for callers; always returns []
 export function getPodConditionErrors(_pod: k8s.V1Pod): string[] {
   return []
@@ -1689,14 +1753,26 @@ export function getPodConditionErrors(_pod: k8s.V1Pod): string[] {
 // attach describePodFailure diagnostics and throw.
 export async function checkUnrecoverableErrors(
   pod: k8s.V1Pod,
-  podName: string
+  podName: string,
+  schedulingGrace: {
+    firstSeen?: number
+    now?: number
+    graceMs?: number
+  } = {}
 ): Promise<string[]> {
   // Deterministic terminal errors on a container (e.g. ImagePullBackOff).
   const containerErrors = getContainerErrors(pod)
   // Terminated container errors (e.g. OOMKilled, non-zero exit) with hints.
   const terminatedErrors = getContainerTerminatedErrors(pod)
   // Best-effort: returns [] when the optional events RBAC permission is absent.
-  const eventErrors = await getPodEventErrors(podName)
+  // The scheduling grace window starts at the pod's creationTimestamp so it
+  // survives hook restarts and job retries.
+  const eventErrors = await getPodEventErrors(podName, {
+    creationTimestamp: pod.metadata?.creationTimestamp,
+    firstSeen: schedulingGrace.firstSeen,
+    now: schedulingGrace.now,
+    graceMs: schedulingGrace.graceMs
+  })
   // Conditions are set near-instantly by the scheduler while events may take
   // a few extra seconds to propagate, so always run the check. Deduplicate
   // against events so the same FailedScheduling isn't printed twice.
@@ -1725,6 +1801,21 @@ export async function waitForPodPhases(
   // (see evaluateImagePullFailures). Mutated in place across poll iterations.
   const imagePullFirstSeen = new Map<string, number>()
   const imagePullGraceMs = getImagePullGraceMs()
+  // Scheduling failures are only reported after this window (measured from the
+  // pod's creationTimestamp), so a job queued behind a scale-up is not killed
+  // within the first couple of polls. The prepare-job timeout remains the outer
+  // bound: cap the window at it when configured larger.
+  const maxTimeMs = maxTimeSeconds * 1000
+  let schedulingGraceMs = getSchedulingGraceMs()
+  if (schedulingGraceMs >= maxTimeMs) {
+    core.warning(
+      `Scheduling grace (${schedulingGraceMs / 1000}s) is >= the prepare job timeout (${maxTimeSeconds}s); using ${maxTimeSeconds}s`
+    )
+    schedulingGraceMs = maxTimeMs
+  }
+  // Fallback start for the grace window when the pod has no creationTimestamp:
+  // the first successful observation in this loop.
+  let podFirstSeen: number | undefined
   let phase: PodPhase = PodPhase.UNKNOWN
   while (true) {
     let pod: k8s.V1Pod
@@ -1751,6 +1842,10 @@ export async function waitForPodPhases(
       continue
     }
     phase = parsePodPhase(pod)
+    const now = Date.now()
+    if (podFirstSeen === undefined) {
+      podFirstSeen = now
+    }
     if (awaitingPhases.has(phase)) {
       return
     }
@@ -1761,7 +1856,11 @@ export async function waitForPodPhases(
     // reported with actionable hints. Fall back to the generic "is unhealthy"
     // message when no specific error is found.
     if (!backOffPhases.has(phase)) {
-      const errors = await checkUnrecoverableErrors(pod, podName)
+      const errors = await checkUnrecoverableErrors(pod, podName, {
+        firstSeen: podFirstSeen,
+        now,
+        graceMs: schedulingGraceMs
+      })
       const details = await describePodFailure(podName)
       if (errors.length > 0) {
         throw new Error(
@@ -1777,7 +1876,6 @@ export async function waitForPodPhases(
     // detected (container / event / condition) OR an image-pull failure has
     // persisted past its grace period / matched a permanent pattern. Fail fast
     // with diagnostics instead of waiting out the full timeout.
-    const now = Date.now()
     let imagePullErrors = evaluateImagePullFailures(
       pod,
       imagePullFirstSeen,
@@ -1810,7 +1908,11 @@ export async function waitForPodPhases(
         )
       }
     }
-    const errors = await checkUnrecoverableErrors(pod, podName)
+    const errors = await checkUnrecoverableErrors(pod, podName, {
+      firstSeen: podFirstSeen,
+      now,
+      graceMs: schedulingGraceMs
+    })
     const allErrors = [...imagePullErrors, ...errors]
     if (allErrors.length > 0) {
       const details = await describePodFailure(podName)

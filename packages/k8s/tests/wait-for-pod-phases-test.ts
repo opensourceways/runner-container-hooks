@@ -1,17 +1,19 @@
 import * as k8s from '@kubernetes/client-node'
+import * as core from '@actions/core'
 import {
+  DEFAULT_SCHEDULING_GRACE_MS,
   describePodFailure,
   evaluateImagePullFailures,
   getContainerErrors,
   getContainerTerminatedErrors,
   getImagePullGraceMs,
   getPodEventErrors,
+  getSchedulingGraceMs,
   getUnrecoverableEventReasons,
   getUnrecoverableTerminatedReasons,
   getUnrecoverableWaitingReasons,
-  isPermanentSchedulingFailure,
+  isSchedulingGraceElapsed,
   parsePodPhase,
-  PERMANENT_SCHEDULING_PATTERNS,
   UNRECOVERABLE_EVENT_REASONS,
   UNRECOVERABLE_TERMINATED_REASONS,
   UNRECOVERABLE_WAITING_REASONS,
@@ -26,9 +28,13 @@ function buildPod(
   opts: {
     containerStatuses?: k8s.V1ContainerStatus[]
     initContainerStatuses?: k8s.V1ContainerStatus[]
+    creationTimestamp?: Date
   } = {}
 ): k8s.V1Pod {
   return {
+    metadata: opts.creationTimestamp
+      ? { creationTimestamp: opts.creationTimestamp }
+      : undefined,
     status: {
       phase,
       containerStatuses: opts.containerStatuses,
@@ -89,6 +95,15 @@ function podResult(pod: k8s.V1Pod): never {
 function eventResult(items: k8s.CoreV1Event[]): never {
   return { items } as never
 }
+
+// Real scheduler message from the incident: the node-affinity line is normal
+// (NPU/amd64 nodes are excluded by the job template); the cpu/memory shortage
+// on the remaining nodes is what actually kept the pod unschedulable.
+const MIXED_FAILED_SCHEDULING_MESSAGE =
+  "0/18 nodes are available: 12 node(s) didn't match Pod's node affinity/selector, " +
+  '6 Insufficient cpu, 6 Insufficient memory. preemption: 0/18 nodes are ' +
+  "available: 12 node(s) didn't match Pod's node affinity/selector, " +
+  '6 Insufficient cpu, 6 Insufficient memory. No preemption victims found.'
 
 describe('parsePodPhase', () => {
   it('returns the phase when it is a known value', () => {
@@ -356,6 +371,7 @@ describe('getPodEventErrors', () => {
     jest.restoreAllMocks()
     delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
     delete process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_EVENT_REASONS']
+    delete process.env['ACTIONS_RUNNER_K8S_SCHEDULING_GRACE_SECONDS']
   })
 
   it('returns no errors when there are no warning events', async () => {
@@ -390,23 +406,118 @@ describe('getPodEventErrors', () => {
     expect(errors[0]).toContain('PVC')
   })
 
-  it('fast-fails on FailedScheduling with permanent config errors', async () => {
-    for (const msg of [
-      "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector.",
-      '0/3 nodes are available: 3 node(s) had untolerated taint {gpu: true}.',
-      '0/3 nodes are available: persistentvolumeclaim "my-pvc" not found. preemption: 0/3'
-    ]) {
-      eventSpy.mockResolvedValue(
-        eventResult([buildEvent('FailedScheduling', msg)])
-      )
-      const errors = await getPodEventErrors('my-pod')
-      expect(errors).toHaveLength(1)
-      expect(errors[0]).toContain('  ✗ event: FailedScheduling')
-      expect(errors[0]).toContain('→')
-    }
+  it('keeps queuing on the incident FailedScheduling message within the grace window', async () => {
+    // The affinity line used to trigger an immediate fast-fail even though the
+    // real blocker was the cpu/memory shortage on the remaining nodes.
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedScheduling', MIXED_FAILED_SCHEDULING_MESSAGE)
+      ])
+    )
+    const now = Date.now()
+    expect(
+      await getPodEventErrors('my-pod', {
+        creationTimestamp: new Date(now - 80 * 1000),
+        now,
+        graceMs: DEFAULT_SCHEDULING_GRACE_MS
+      })
+    ).toEqual([])
   })
 
-  it('does NOT fast-fail on FailedScheduling with resource shortages (keeps queuing)', async () => {
+  it('reports FailedScheduling once the grace window has expired', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedScheduling', MIXED_FAILED_SCHEDULING_MESSAGE)
+      ])
+    )
+    const now = Date.now()
+    const errors = await getPodEventErrors('my-pod', {
+      creationTimestamp: new Date(now - 601 * 1000),
+      now,
+      graceMs: DEFAULT_SCHEDULING_GRACE_MS
+    })
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('  ✗ event: FailedScheduling')
+    expect(errors[0]).toContain(MIXED_FAILED_SCHEDULING_MESSAGE)
+    expect(errors[0]).toContain('601s')
+    expect(errors[0]).toContain('past the grace period')
+    expect(errors[0]).toContain('kubectl describe pod')
+  })
+
+  it('uses the newest FailedScheduling message when several events exist', async () => {
+    const now = Date.now()
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent(
+          'FailedScheduling',
+          '0/3 nodes are available: 3 Insufficient cpu.',
+          {
+            count: 4,
+            lastTimestamp: new Date(now - 500 * 1000)
+          }
+        ),
+        buildEvent(
+          'FailedScheduling',
+          '0/3 nodes are available: 3 Insufficient memory.',
+          {
+            count: 9,
+            lastTimestamp: new Date(now - 10 * 1000)
+          }
+        )
+      ])
+    )
+    const errors = await getPodEventErrors('my-pod', {
+      creationTimestamp: new Date(now - 601 * 1000),
+      now,
+      graceMs: DEFAULT_SCHEDULING_GRACE_MS
+    })
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('3 Insufficient memory')
+    expect(errors[0]).not.toContain('3 Insufficient cpu')
+    expect(errors[0]).toContain('(x9)')
+  })
+
+  it('fails immediately when the scheduling grace is disabled (0)', async () => {
+    process.env['ACTIONS_RUNNER_K8S_SCHEDULING_GRACE_SECONDS'] = '0'
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedScheduling', MIXED_FAILED_SCHEDULING_MESSAGE)
+      ])
+    )
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('  ✗ event: FailedScheduling')
+  })
+
+  it('falls back to the first observation when creationTimestamp is missing', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedScheduling', MIXED_FAILED_SCHEDULING_MESSAGE)
+      ])
+    )
+    const now = Date.now()
+    // Within the grace window: start counts from the first observation.
+    expect(
+      await getPodEventErrors('my-pod', {
+        creationTimestamp: undefined,
+        firstSeen: now - 60 * 1000,
+        now,
+        graceMs: DEFAULT_SCHEDULING_GRACE_MS
+      })
+    ).toEqual([])
+    // Beyond the grace window: the fallback start is used, not `now`.
+    const errors = await getPodEventErrors('my-pod', {
+      creationTimestamp: undefined,
+      firstSeen: now - 601 * 1000,
+      now,
+      graceMs: DEFAULT_SCHEDULING_GRACE_MS
+    })
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('  ✗ event: FailedScheduling')
+    expect(errors[0]).toContain('601s')
+  })
+
+  it('does not report FailedScheduling while it is within the grace window', async () => {
     for (const msg of [
       '0/3 nodes are available: 3 Insufficient nvidia.com/gpu.',
       '0/5 nodes are available: 5 Insufficient memory.',
@@ -417,7 +528,7 @@ describe('getPodEventErrors', () => {
       )
       expect(await getPodEventErrors('my-pod')).toEqual([])
     }
-    // No message at all — unknown cause, treat as transient
+    // No message at all — the grace window still applies
     eventSpy.mockResolvedValue(
       eventResult([
         { type: 'Warning', reason: 'FailedScheduling' } as k8s.CoreV1Event
@@ -483,64 +594,84 @@ describe('getPodEventErrors', () => {
   })
 })
 
-describe('isPermanentSchedulingFailure', () => {
-  it('returns true for node affinity/selector mismatch', () => {
-    expect(
-      isPermanentSchedulingFailure(
-        "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."
-      )
-    ).toBe(true)
-    expect(
-      isPermanentSchedulingFailure(
-        "0/5 nodes are available: 5 node(s) didn't match node affinity."
-      )
-    ).toBe(true)
-  })
+describe('isSchedulingGraceElapsed', () => {
+  const now = Date.UTC(2026, 0, 1, 0, 0, 0)
+  const graceMs = 600 * 1000
 
-  it('returns true for untolerated taint', () => {
+  it('measures the window from the pod creationTimestamp', () => {
     expect(
-      isPermanentSchedulingFailure(
-        '0/3 nodes are available: 3 node(s) had untolerated taint {gpu: true}.'
-      )
+      isSchedulingGraceElapsed(new Date(now - graceMs + 1), now, graceMs)
+    ).toBe(false)
+    expect(
+      isSchedulingGraceElapsed(new Date(now - graceMs), now, graceMs)
+    ).toBe(true)
+    expect(
+      isSchedulingGraceElapsed(new Date(now - graceMs * 2), now, graceMs)
     ).toBe(true)
   })
 
-  it('returns true for PVC not found', () => {
+  it('accepts a string timestamp', () => {
+    const created = new Date(now - graceMs * 2).toISOString()
+    expect(isSchedulingGraceElapsed(created, now, graceMs)).toBe(true)
+  })
+
+  it('falls back to the first observation when creationTimestamp is missing', () => {
     expect(
-      isPermanentSchedulingFailure(
-        '0/3 nodes are available: persistentvolumeclaim "my-pvc" not found. preemption: 0/3'
-      )
+      isSchedulingGraceElapsed(undefined, now, graceMs, now - 60 * 1000)
+    ).toBe(false)
+    expect(
+      isSchedulingGraceElapsed(undefined, now, graceMs, now - graceMs)
     ).toBe(true)
   })
 
-  it('returns false for resource shortages (transient — keep queuing)', () => {
+  it('treats an invalid creationTimestamp as missing', () => {
     expect(
-      isPermanentSchedulingFailure(
-        '0/3 nodes are available: 3 Insufficient nvidia.com/gpu.'
-      )
+      isSchedulingGraceElapsed('not-a-date', now, graceMs, now - 60 * 1000)
     ).toBe(false)
     expect(
-      isPermanentSchedulingFailure(
-        '0/5 nodes are available: 5 Insufficient memory.'
-      )
-    ).toBe(false)
-    expect(
-      isPermanentSchedulingFailure(
-        '0/2 nodes are available: 2 Insufficient cpu.'
-      )
-    ).toBe(false)
+      isSchedulingGraceElapsed('not-a-date', now, graceMs, now - graceMs)
+    ).toBe(true)
   })
 
-  it('returns false for ambiguous / unknown messages (safe default: keep queuing)', () => {
-    expect(isPermanentSchedulingFailure('0/1 nodes are available')).toBe(false)
-    expect(
-      isPermanentSchedulingFailure('preemption: 0/3 nodes are available')
-    ).toBe(false)
-    expect(isPermanentSchedulingFailure(undefined)).toBe(false)
+  it('does not skip the window when no start time is available at all', () => {
+    // start falls back to `now`, so the window has just begun.
+    expect(isSchedulingGraceElapsed(undefined, now, graceMs)).toBe(false)
   })
 
-  it('PERMANENT_SCHEDULING_PATTERNS is non-empty', () => {
-    expect(PERMANENT_SCHEDULING_PATTERNS.length).toBeGreaterThan(0)
+  it('elapses immediately when the grace is 0 (window disabled)', () => {
+    expect(isSchedulingGraceElapsed(new Date(now), now, 0)).toBe(true)
+  })
+})
+
+describe('getSchedulingGraceMs', () => {
+  afterEach(() => {
+    delete process.env['ACTIONS_RUNNER_K8S_SCHEDULING_GRACE_SECONDS']
+    jest.restoreAllMocks()
+  })
+
+  it('returns the default 10 minutes when the env var is unset', () => {
+    expect(getSchedulingGraceMs()).toBe(10 * 60 * 1000)
+    expect(DEFAULT_SCHEDULING_GRACE_MS).toBe(10 * 60 * 1000)
+  })
+
+  it('reads ACTIONS_RUNNER_K8S_SCHEDULING_GRACE_SECONDS in seconds', () => {
+    process.env['ACTIONS_RUNNER_K8S_SCHEDULING_GRACE_SECONDS'] = '120'
+    expect(getSchedulingGraceMs()).toBe(120 * 1000)
+  })
+
+  it('returns 0 when the grace is disabled', () => {
+    process.env['ACTIONS_RUNNER_K8S_SCHEDULING_GRACE_SECONDS'] = '0'
+    expect(getSchedulingGraceMs()).toBe(0)
+  })
+
+  it('warns and falls back to the default for invalid or negative values', () => {
+    const warningSpy = jest.spyOn(core, 'warning').mockImplementation(() => {})
+    for (const invalid of ['abc', '-5']) {
+      warningSpy.mockClear()
+      process.env['ACTIONS_RUNNER_K8S_SCHEDULING_GRACE_SECONDS'] = invalid
+      expect(getSchedulingGraceMs()).toBe(10 * 60 * 1000)
+      expect(warningSpy).toHaveBeenCalledTimes(1)
+    }
   })
 })
 
@@ -788,6 +919,7 @@ describe('waitForPodPhases', () => {
     jest.restoreAllMocks()
     delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
     delete process.env['ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS']
+    delete process.env['ACTIONS_RUNNER_K8S_SCHEDULING_GRACE_SECONDS']
   })
 
   it('returns once the pod reaches an awaited phase', async () => {
@@ -1151,8 +1283,14 @@ describe('waitForPodPhases', () => {
     )
   })
 
-  it('fast-fails on FailedScheduling with permanent message (PVC not found)', async () => {
-    readSpy.mockResolvedValue(podResult(buildPod(PodPhase.PENDING)))
+  it('fast-fails on FailedScheduling once the grace window has expired', async () => {
+    readSpy.mockResolvedValue(
+      podResult(
+        buildPod(PodPhase.PENDING, {
+          creationTimestamp: new Date(Date.now() - 601 * 1000)
+        })
+      )
+    )
     eventSpy.mockResolvedValue(
       eventResult([
         buildEvent(
@@ -1167,7 +1305,50 @@ describe('waitForPodPhases', () => {
         new Set([PodPhase.RUNNING]),
         new Set([PodPhase.PENDING])
       )
+    ).rejects.toThrow(
+      /has unrecoverable errors:[\s\S]*event: FailedScheduling[\s\S]*past the grace period/
+    )
+  })
+
+  it('fails immediately on FailedScheduling when the grace is set to 0', async () => {
+    process.env['ACTIONS_RUNNER_K8S_SCHEDULING_GRACE_SECONDS'] = '0'
+    readSpy.mockResolvedValue(podResult(buildPod(PodPhase.PENDING)))
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedScheduling', MIXED_FAILED_SCHEDULING_MESSAGE)
+      ])
+    )
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
     ).rejects.toThrow(/has unrecoverable errors:[\s\S]*event: FailedScheduling/)
+  })
+
+  it('keeps polling the incident FailedScheduling message within the grace window', async () => {
+    readSpy
+      .mockResolvedValueOnce(
+        podResult(
+          buildPod(PodPhase.PENDING, {
+            creationTimestamp: new Date(Date.now() - 80 * 1000)
+          })
+        )
+      )
+      .mockResolvedValueOnce(podResult(buildPod(PodPhase.RUNNING)))
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedScheduling', MIXED_FAILED_SCHEDULING_MESSAGE)
+      ])
+    )
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).resolves.toBeUndefined()
   })
 
   it('does NOT fast-fail on FailedScheduling with Insufficient resources (keeps polling)', async () => {
@@ -1189,6 +1370,33 @@ describe('waitForPodPhases', () => {
         new Set([PodPhase.PENDING])
       )
     ).resolves.toBeUndefined()
+  })
+
+  it('still fails on container-level errors while inside the scheduling grace window', async () => {
+    readSpy.mockResolvedValue(
+      podResult(
+        buildPod(PodPhase.PENDING, {
+          creationTimestamp: new Date(Date.now() - 30 * 1000),
+          containerStatuses: [
+            waitingContainer('job', 'InvalidImageName', 'nope')
+          ]
+        })
+      )
+    )
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedScheduling', MIXED_FAILED_SCHEDULING_MESSAGE)
+      ])
+    )
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).rejects.toThrow(
+      /has unrecoverable errors:[\s\S]*container "job": InvalidImageName/
+    )
   })
 
   it('retries on transient readPod failure and recovers when pod becomes ready', async () => {
