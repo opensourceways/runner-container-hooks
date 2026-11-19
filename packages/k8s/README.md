@@ -33,6 +33,10 @@ rules:
   `ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS`). The hooks still work without
   it — they omit the event section from diagnostics and fall back to the plain
   grace window, which can abort a slow but progressing pull.
+  `FailedScheduling` events are reported in diagnostics but never trigger a fast
+  fail: the pod keeps queuing until the prepare-job timeout, because a single
+  scheduler message often mixes normal node-affinity exclusions with real
+  capacity shortages.
 ```
 - apiGroups: [""]
   resources: ["events"]
@@ -67,24 +71,6 @@ rules:
       tag, invalid credentials, missing repository) are detected from the
       waiting message and still fail immediately. Set to `0` to fail as soon as
       the pull failure is observed (the previous behavior).
-    - `ACTIONS_RUNNER_K8S_SCHEDULING_GRACE_SECONDS` — how long a job pod may stay
-      unschedulable (`FailedScheduling`) before the hook fails it (default
-      `600`, i.e. 10 minutes). The window is measured from the job pod's
-      `metadata.creationTimestamp`, so a hook restart or a job retry never
-      restarts the clock; if that timestamp is missing the hook falls back to
-      the first time it observed the pod. Within the window the pod keeps
-      queuing (a periodic progress line is logged) and no error is raised, so a
-      job waiting for nodes to scale up is not killed. Once the window expires
-      the hook fails with the last scheduler message and the elapsed time.
-      Scheduler message text is never matched on its own: a single message often
-      mixes a normal "node(s) didn't match Pod's node affinity/selector" line
-      with real cpu/memory shortages. Deterministic failures such as
-      `FailedMount`, `FailedBinding` and container-level errors still fail
-      immediately. Set to `0` to disable the window (fail as soon as
-      `FailedScheduling` is observed). The prepare-job timeout
-      (`ACTIONS_RUNNER_PREPARE_JOB_TIMEOUT_SECONDS`) remains the outer bound; if
-      the grace is greater than or equal to it, the timeout wins (with a
-      warning).
 
 
 ## Limitations
