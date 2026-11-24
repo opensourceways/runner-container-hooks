@@ -710,7 +710,7 @@ export async function execCpToPod(
 // ever published.
 // ---------------------------------------------------------------------------
 
-const CP_FROM_POD_MAX_ATTEMPTS = 30
+const CP_FROM_POD_MAX_ATTEMPTS = 5
 const CP_FROM_POD_BACKOFF_BASE_MS = 1000
 const CP_FROM_POD_BACKOFF_MAX_MS = 30 * 1000
 const CP_FROM_POD_ATTEMPT_TIMEOUT_MS = 15 * 60 * 1000
