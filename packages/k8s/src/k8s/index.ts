@@ -1,14 +1,16 @@
 import * as core from '@actions/core'
 import * as fs from 'fs'
 import * as path from 'path'
+import * as net from 'net'
 import { spawn } from 'child_process'
 import * as k8s from '@kubernetes/client-node'
 import tar from 'tar-fs'
 import * as stream from 'stream'
 import { WritableStreamBuffer } from 'stream-buffers'
-import { createHash } from 'crypto'
+import { createHash, randomBytes, timingSafeEqual } from 'crypto'
 import type { ContainerInfo, Registry } from 'hooklib'
 import {
+  getRunnerPodName,
   getSecretName,
   JOB_CONTAINER_NAME,
   RunnerInstanceLabel
@@ -1036,32 +1038,17 @@ async function isPodSyncUnchanged(
   }
 }
 
-// Runs one transfer attempt. Resolves only after tar-fs finished flushing the
-// archive to disk; rejects on any stream error, stderr output, non-Success
-// exec status, timeout or transport failure.
-async function transferTarFromPodOnce(
-  podName: string,
-  containerPath: string,
+// Builds the tar extraction sink shared by both transfer modes.
+//
+// tar-fs opens a write stream per file entry asynchronously. When the archive
+// turns out to be truncated, entries may still start writing after the attempt
+// was aborted; on Windows such a handle keeps the staging directory
+// undeletable. Tracking the streams lets us close them, and a discarded sink
+// prevents late entries from touching the filesystem at all.
+function createStagingSink(
   stagingRoot: string,
-  settings: CpFromPodSettings,
-  timeoutMs: number,
   progress: TransferProgress
-): Promise<void> {
-  const containerPaths = containerPath.split('/')
-  const dirname = containerPaths.pop() as string
-  const command = ['tar', 'cf', '-']
-  for (const pattern of settings.excludePatterns) {
-    command.push(`--exclude=${pattern}`)
-  }
-  command.push('-C', containerPaths.join('/') || '/', dirname)
-
-  const exec = new k8s.Exec(kc)
-
-  // tar-fs opens a write stream per file entry asynchronously. When the
-  // archive turns out to be truncated, entries may still start writing after
-  // the attempt was aborted; on Windows such a handle keeps the staging
-  // directory undeletable. Tracking the streams lets us close them, and a
-  // discarded sink prevents late entries from touching the filesystem at all.
+): { writerStream: ReturnType<typeof tar.extract>; abort: () => void } {
   let aborted = false
   const openWriteStreams = new Set<stream.Writable>()
   // `fs` is a module namespace object with getter-only properties, so a
@@ -1087,7 +1074,6 @@ async function transferTarFromPodOnce(
   }) as typeof fs.createWriteStream
 
   const writerStream = tar.extract(stagingRoot, { fs: trackingFs })
-  const errStream = new WritableStreamBuffer()
 
   // Count received bytes without inserting another stream into the pipe.
   const originalWrite = writerStream.write.bind(writerStream) as (
@@ -1108,6 +1094,337 @@ async function transferTarFromPodOnce(
     return originalWrite(chunk, encodingOrCallback, callback)
   }) as typeof writerStream.write
 
+  const abort = (): void => {
+    aborted = true
+    try {
+      if (!writerStream.destroyed) {
+        writerStream.destroy()
+      }
+    } catch (destroyError) {
+      core.debug(
+        `[cpFromPod] destroying the extract stream failed: ${errorText(destroyError)}`
+      )
+    }
+    openWriteStreams.forEach(writeStream => {
+      try {
+        writeStream.destroy()
+      } catch (destroyError) {
+        core.debug(
+          `[cpFromPod] destroying a staged write stream failed: ${errorText(destroyError)}`
+        )
+      }
+    })
+    openWriteStreams.clear()
+  }
+
+  return { writerStream, abort }
+}
+
+// ---------------------------------------------------------------------------
+// Direct pod-to-pod transfer (opt-in: HOOKS_SYNC_MODE=direct)
+//
+// The exec based transfer above tunnels the tar stream through the API
+// server: runner pod -> apiserver -> kubelet -> job container. When the
+// apiserver runs in another site than the job pods (cloud managed control
+// plane, lab workers), every byte crosses that slow link twice and large
+// /__w/_temp trees get truncated. In direct mode the job container pushes the
+// very same tar stream straight to the runner pod over the pod network; the
+// exec channel is only used to start the sender and carries no payload.
+//
+// Any direct failure falls back to the exec channel, and after
+// DIRECT_SYNC_MAX_CONSECUTIVE_FAILURES failures the mode is disabled for the
+// rest of the process, so a missing bash in the job container can never make
+// the sync harder than it is today.
+// ---------------------------------------------------------------------------
+
+const DIRECT_SYNC_MAX_CONSECUTIVE_FAILURES = 2
+// Upper bound on the token line; the token itself is 32 hex characters, so
+// anything larger is either a bug or an attacker probing the port.
+const HANDSHAKE_MAX_BYTES = 128
+let directSyncConsecutiveFailures = 0
+
+function syncModeIsDirect(): boolean {
+  return (
+    (process.env['HOOKS_SYNC_MODE'] || '').trim().toLowerCase() === 'direct'
+  )
+}
+
+function shQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+// The address the job container connects back to: the runner pod IP unless an
+// explicit override is configured.
+async function getSyncListenAddress(): Promise<string> {
+  const override = (process.env['HOOKS_SYNC_LISTEN_IP'] || '').trim()
+  if (override) {
+    return override
+  }
+  const pod = await readPod(getRunnerPodName())
+  const podIP = pod.status?.podIP
+  if (!podIP) {
+    throw new Error('the runner pod has no podIP yet')
+  }
+  return podIP
+}
+
+// Runs one direct transfer attempt: the runner pod listens on an ephemeral
+// port bound to its own pod IP, and the job container opens one connection to
+// it, sends a one-time token, then streams
+//   tar cf - <excludes> -C <parent> <dirname>
+// over that connection, so the payload never goes through the API server.
+async function transferTarFromPodDirectOnce(
+  podName: string,
+  containerPath: string,
+  stagingRoot: string,
+  settings: CpFromPodSettings,
+  timeoutMs: number,
+  progress: TransferProgress
+): Promise<void> {
+  const listenAddress = await getSyncListenAddress()
+
+  const containerPaths = containerPath.split('/')
+  const dirname = containerPaths.pop() as string
+  const parentDir = containerPaths.join('/') || '/'
+
+  const sink = createStagingSink(stagingRoot, progress)
+  const writerStream = sink.writerStream
+  const errStream = new WritableStreamBuffer()
+
+  const transferToken = randomBytes(16).toString('hex')
+  const tokenMatches = (received: string): boolean => {
+    const expected = Buffer.from(transferToken, 'utf8')
+    const actual = Buffer.from(received, 'utf8')
+    return (
+      actual.length === expected.length && timingSafeEqual(expected, actual)
+    )
+  }
+
+  const server = net.createServer()
+  const sockets = new Set<net.Socket>()
+  let execSocket: { close: () => void } | undefined
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+
+      const settle = (failure?: unknown): void => {
+        if (settled) {
+          return
+        }
+        settled = true
+        if (timer) {
+          clearTimeout(timer)
+        }
+        sink.abort()
+        sockets.forEach(socket => {
+          try {
+            socket.destroy()
+          } catch (destroyError) {
+            core.debug(
+              `[cpFromPod] destroying a direct-transfer socket failed: ${errorText(destroyError)}`
+            )
+          }
+        })
+        sockets.clear()
+        try {
+          server.close()
+        } catch (closeError) {
+          core.debug(
+            `[cpFromPod] closing the direct-transfer listener failed: ${errorText(closeError)}`
+          )
+        }
+        try {
+          execSocket?.close()
+        } catch (closeError) {
+          core.debug(
+            `[cpFromPod] closing the exec socket failed: ${errorText(closeError)}`
+          )
+        }
+        if (failure === undefined) {
+          resolve()
+        } else {
+          reject(
+            failure instanceof Error ? failure : new Error(errorText(failure))
+          )
+        }
+      }
+
+      writerStream.on('error', (streamError: Error) => settle(streamError))
+      writerStream.on('finish', () => settle())
+      writerStream.on(
+        'entry',
+        (_header: unknown, entryStream: stream.Readable) => {
+          entryStream.on('error', (entryError: Error) => settle(entryError))
+        }
+      )
+
+      timer = setTimeout(() => {
+        settle(
+          new Error(
+            `direct transfer timed out after ${timeoutMs}ms (${progress.bytes} bytes received)`
+          )
+        )
+      }, timeoutMs)
+
+      server.on('connection', (socket: net.Socket) => {
+        if (sockets.size > 0) {
+          socket.destroy()
+          return
+        }
+        sockets.add(socket)
+
+        // The port is reachable by every pod in the cluster, so the first
+        // bytes on the wire must be the one-time token handed to the job
+        // container through the exec command. Anything else is dropped before
+        // it can touch the staging directory.
+        let pending = Buffer.alloc(0)
+        let authenticated = false
+
+        socket.on('error', (socketError: Error) => settle(socketError))
+        socket.on('data', (chunk: Buffer) => {
+          if (authenticated) {
+            if (!writerStream.write(chunk)) {
+              socket.pause()
+            }
+            return
+          }
+          pending = Buffer.concat([pending, chunk])
+          const newline = pending.indexOf(0x0a)
+          if (newline === -1) {
+            if (pending.length > HANDSHAKE_MAX_BYTES) {
+              settle(
+                new Error('direct transfer handshake exceeded its size limit')
+              )
+            }
+            return
+          }
+          const received = pending.subarray(0, newline).toString('utf8')
+          const remainder = pending.subarray(newline + 1)
+          if (!tokenMatches(received)) {
+            settle(
+              new Error('direct transfer handshake carried an invalid token')
+            )
+            return
+          }
+          authenticated = true
+          pending = Buffer.alloc(0)
+          if (remainder.length && !writerStream.write(remainder)) {
+            socket.pause()
+          }
+        })
+        socket.on('end', () => {
+          if (!authenticated) {
+            settle(
+              new Error(
+                'direct transfer connection closed before authenticating'
+              )
+            )
+            return
+          }
+          // tar-stream settles the attempt on 'finish' once the archive is
+          // flushed to disk; ending the extract stream is what starts that.
+          writerStream.end()
+        })
+        writerStream.on('drain', () => socket.resume())
+      })
+      server.on('error', (serverError: Error) => settle(serverError))
+
+      server.listen(0, listenAddress, () => {
+        const port = (server.address() as net.AddressInfo).port
+        const excludeArgs = settings.excludePatterns
+          .map(pattern => `--exclude=${shQuote(pattern)}`)
+          .join(' ')
+        // `exec 3<>` keeps a single descriptor for the token and the archive,
+        // so the handshake and the payload share one connection.
+        const script =
+          `exec 3<>/dev/tcp/${listenAddress}/${port} || exit 1\n` +
+          `printf '%s\\n' ${shQuote(transferToken)} >&3\n` +
+          `exec tar cf - ${excludeArgs ? `${excludeArgs} ` : ''}` +
+          `-C ${shQuote(parentDir)} ${shQuote(dirname)} >&3`
+
+        new k8s.Exec(kc)
+          .exec(
+            namespace(),
+            podName,
+            JOB_CONTAINER_NAME,
+            ['bash', '-c', script],
+            null,
+            errStream,
+            null,
+            false,
+            (status: k8s.V1Status) => {
+              const details = errStream.size()
+                ? `: ${String(errStream.getContentsAsString()).trim()}`
+                : ''
+              if (status.status !== 'Success') {
+                settle(
+                  new Error(
+                    `pod-side tar exited with status '${status.status}'${details}`
+                  )
+                )
+                return
+              }
+              if (errStream.size()) {
+                settle(new Error(`pod-side tar reported an error${details}`))
+              }
+              // Do not resolve here: the extraction stream still has to be
+              // flushed to disk; 'finish' settles the attempt.
+            }
+          )
+          .then(webSocket => {
+            execSocket = webSocket
+            if (settled) {
+              try {
+                webSocket.close()
+              } catch (closeError) {
+                core.debug(
+                  `[cpFromPod] closing a late exec socket failed: ${errorText(closeError)}`
+                )
+              }
+            }
+          })
+          .catch((execError: unknown) => settle(execError))
+      })
+    })
+  } finally {
+    sink.abort()
+    try {
+      server.close()
+    } catch (closeError) {
+      core.debug(
+        `[cpFromPod] closing the direct-transfer listener failed: ${errorText(closeError)}`
+      )
+    }
+  }
+}
+
+// Runs one transfer attempt. Resolves only after tar-fs finished flushing the
+// archive to disk; rejects on any stream error, stderr output, non-Success
+// exec status, timeout or transport failure.
+async function transferTarFromPodOnce(
+  podName: string,
+  containerPath: string,
+  stagingRoot: string,
+  settings: CpFromPodSettings,
+  timeoutMs: number,
+  progress: TransferProgress
+): Promise<void> {
+  const containerPaths = containerPath.split('/')
+  const dirname = containerPaths.pop() as string
+  const command = ['tar', 'cf', '-']
+  for (const pattern of settings.excludePatterns) {
+    command.push(`--exclude=${pattern}`)
+  }
+  command.push('-C', containerPaths.join('/') || '/', dirname)
+
+  const exec = new k8s.Exec(kc)
+
+  const sink = createStagingSink(stagingRoot, progress)
+  const writerStream = sink.writerStream
+  const errStream = new WritableStreamBuffer()
+
   let socket: { close: () => void } | undefined
 
   await new Promise<void>((resolve, reject) => {
@@ -1119,29 +1436,10 @@ async function transferTarFromPodOnce(
         return
       }
       settled = true
-      aborted = true
       if (timer) {
         clearTimeout(timer)
       }
-      try {
-        if (!writerStream.destroyed) {
-          writerStream.destroy()
-        }
-      } catch (destroyError) {
-        core.debug(
-          `[cpFromPod] destroying the extract stream failed: ${errorText(destroyError)}`
-        )
-      }
-      openWriteStreams.forEach(writeStream => {
-        try {
-          writeStream.destroy()
-        } catch (destroyError) {
-          core.debug(
-            `[cpFromPod] destroying a staged write stream failed: ${errorText(destroyError)}`
-          )
-        }
-      })
-      openWriteStreams.clear()
+      sink.abort()
       try {
         socket?.close()
       } catch (closeError) {
@@ -1303,14 +1601,48 @@ export async function execCpFromPod(
     const attemptStartedAt = Date.now()
 
     try {
-      await transferTarFromPodOnce(
-        podName,
-        containerPath,
-        stagingRoot,
-        settings,
-        Math.min(settings.attemptTimeoutMs, remainingMs),
-        progress
-      )
+      if (
+        syncModeIsDirect() &&
+        directSyncConsecutiveFailures < DIRECT_SYNC_MAX_CONSECUTIVE_FAILURES
+      ) {
+        try {
+          await transferTarFromPodDirectOnce(
+            podName,
+            containerPath,
+            stagingRoot,
+            settings,
+            Math.min(settings.attemptTimeoutMs, remainingMs),
+            progress
+          )
+        } catch (directError) {
+          directSyncConsecutiveFailures++
+          // The partial staging content from the failed direct attempt must
+          // not be mixed with the fallback transfer.
+          removeSyncDirectory(stagingRoot)
+          fs.mkdirSync(stagingRoot, { recursive: true })
+          core.warning(
+            `[cpFromPod] direct pod-to-pod transfer failed (${errorText(directError)}); falling back to the exec channel`
+          )
+          await transferTarFromPodOnce(
+            podName,
+            containerPath,
+            stagingRoot,
+            settings,
+            Math.min(settings.attemptTimeoutMs, remainingMs),
+            progress
+          )
+        }
+      } else {
+        await transferTarFromPodOnce(
+          podName,
+          containerPath,
+          stagingRoot,
+          settings,
+          Math.min(settings.attemptTimeoutMs, remainingMs),
+          progress
+        )
+      }
+      directSyncConsecutiveFailures = 0
       totalBytes += progress.bytes
       const elapsed = Date.now() - attemptStartedAt
       core.debug(

@@ -1,5 +1,6 @@
 import * as k8s from '@kubernetes/client-node'
 import * as fs from 'fs'
+import * as net from 'net'
 import * as os from 'os'
 import * as path from 'path'
 import * as tar from 'tar-fs'
@@ -68,6 +69,8 @@ describe('execCpFromPod', () => {
     delete process.env['HOOKS_SYNC_MAX_ATTEMPTS']
     delete process.env['HOOKS_SYNC_BACKOFF_BASE_MS']
     delete process.env['HOOKS_SYNC_EXCLUDE']
+    delete process.env['HOOKS_SYNC_MODE']
+    delete process.env['HOOKS_SYNC_LISTEN_IP']
   })
 
   // Simulate a pod whose `/__w/_temp` is mirrored by a local fixture
@@ -78,7 +81,12 @@ describe('execCpFromPod', () => {
   // `truncateTransfers` cuts the given number of initial archives in half and
   // ends the stream without a terminal status, which is what a peer close on a
   // slow exec channel leaves behind.
-  function mockPodSide(behavior: { truncateTransfers?: number } = {}): void {
+  //
+  // `badToken` makes the direct-mode sender authenticate with the wrong token,
+  // which must be rejected before any byte reaches the staging directory.
+  function mockPodSide(
+    behavior: { truncateTransfers?: number; badToken?: boolean } = {}
+  ): void {
     let truncationsLeft = behavior.truncateTransfers ?? 0
     execSpy.mockImplementation(
       async (
@@ -106,6 +114,29 @@ describe('execCpFromPod', () => {
           stdout.end()
           callback({ status: 'Success' })
           return Promise.resolve()
+        }
+        if (command[0] === 'bash') {
+          // Direct mode: the pod-side command opens one connection to
+          // /dev/tcp/<runner ip>/<port>, sends the token, then streams tar.
+          // Reproduce both steps over a real socket so the runner side sees
+          // exactly the wire format it validates.
+          const match = /\/dev\/tcp\/([^/\s]+)\/(\d+)/.exec(command[2])
+          const token = /printf '%s\\n' '([0-9a-fA-F]+)'/.exec(command[2])
+          if (match && token) {
+            const sentToken = behavior.badToken ? 'deadbeef' : token[1]
+            const archive = await packToBuffer(podSideDir)
+            await new Promise<void>((resolve, reject) => {
+              const socket = net.connect(Number(match[2]), match[1], () => {
+                socket.write(`${sentToken}\n`)
+                socket.write(archive)
+                socket.end()
+              })
+              socket.on('close', () => resolve())
+              socket.on('error', reject)
+            })
+            callback({ status: 'Success' })
+            return Promise.resolve()
+          }
         }
         const script = command[2]
         stdout.write(
@@ -163,6 +194,49 @@ describe('execCpFromPod', () => {
     expect(
       fs.readFileSync(path.join(workDir, '_temp', 'file.txt'), 'utf8')
     ).toBe('content')
+    expect(fs.readdirSync(workDir).sort()).toEqual(['_temp'])
+  })
+
+  it('syncs over the direct pod-to-pod channel when HOOKS_SYNC_MODE=direct', async () => {
+    process.env['HOOKS_SYNC_MODE'] = 'direct'
+    process.env['HOOKS_SYNC_LISTEN_IP'] = '127.0.0.1'
+
+    const podTemp = path.join(podSideDir, '_temp')
+    fs.mkdirSync(path.join(podTemp, 'nested'), { recursive: true })
+    fs.writeFileSync(path.join(podTemp, 'direct.txt'), 'via socket')
+    fs.writeFileSync(path.join(podTemp, 'nested', 'inner.txt'), 'N')
+
+    mockPodSide()
+
+    await execCpFromPod('test-pod', CONTAINER_TEMP, workDir)
+
+    expect(
+      fs.readFileSync(path.join(workDir, '_temp', 'direct.txt'), 'utf8')
+    ).toBe('via socket')
+    expect(
+      fs.readFileSync(
+        path.join(workDir, '_temp', 'nested', 'inner.txt'),
+        'utf8'
+      )
+    ).toBe('N')
+    expect(fs.readdirSync(workDir).sort()).toEqual(['_temp'])
+  })
+
+  it('rejects a direct connection with the wrong token and falls back to exec', async () => {
+    process.env['HOOKS_SYNC_MODE'] = 'direct'
+    process.env['HOOKS_SYNC_LISTEN_IP'] = '127.0.0.1'
+
+    const podTemp = path.join(podSideDir, '_temp')
+    fs.mkdirSync(podTemp, { recursive: true })
+    fs.writeFileSync(path.join(podTemp, 'secret.txt'), 'payload')
+
+    mockPodSide({ badToken: true })
+
+    await execCpFromPod('test-pod', CONTAINER_TEMP, workDir)
+
+    expect(
+      fs.readFileSync(path.join(workDir, '_temp', 'secret.txt'), 'utf8')
+    ).toBe('payload')
     expect(fs.readdirSync(workDir).sort()).toEqual(['_temp'])
   })
 
