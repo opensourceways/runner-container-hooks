@@ -777,8 +777,14 @@ function cpFromPodSettings(): CpFromPodSettings {
       'HOOKS_SYNC_ATTEMPT_TIMEOUT_MS',
       CP_FROM_POD_ATTEMPT_TIMEOUT_MS
     ),
-    deadlineMs: envPositiveInt('HOOKS_SYNC_DEADLINE_MS', CP_FROM_POD_DEADLINE_MS),
-    slowWarnMs: envPositiveInt('HOOKS_SYNC_SLOW_WARN_MS', CP_FROM_POD_SLOW_WARN_MS),
+    deadlineMs: envPositiveInt(
+      'HOOKS_SYNC_DEADLINE_MS',
+      CP_FROM_POD_DEADLINE_MS
+    ),
+    slowWarnMs: envPositiveInt(
+      'HOOKS_SYNC_SLOW_WARN_MS',
+      CP_FROM_POD_SLOW_WARN_MS
+    ),
     excludePatterns,
     excludeMatchers: excludePatterns.map(pattern => globToRegExp(pattern))
   }
@@ -897,7 +903,9 @@ function walkLocalDirectory(dir: string): LocalSyncEntry[] {
         withFileTypes: true
       })
     } catch (readError) {
-      core.debug(`[cpFromPod] cannot read ${relative || dir}: ${String(readError)}`)
+      core.debug(
+        `[cpFromPod] cannot read ${relative || dir}: ${String(readError)}`
+      )
       return
     }
     for (const child of children) {
@@ -916,7 +924,9 @@ function walkLocalDirectory(dir: string): LocalSyncEntry[] {
             mtimeSeconds: Math.floor(stat.mtimeMs / 1000)
           })
         } catch (statError) {
-          core.debug(`[cpFromPod] cannot stat ${childRel}: ${String(statError)}`)
+          core.debug(
+            `[cpFromPod] cannot stat ${childRel}: ${String(statError)}`
+          )
         }
       }
     }
@@ -988,7 +998,7 @@ function formatTransferRate(bytes: number, elapsedMs: number): string {
   if (elapsedMs <= 0) {
     return 'n/a'
   }
-  return ((bytes / (1024 * 1024)) / (elapsedMs / 1000)).toFixed(3)
+  return (bytes / (1024 * 1024) / (elapsedMs / 1000)).toFixed(3)
 }
 
 // Compares the pod-side directory with the runner-side snapshot. Uses file
@@ -1135,12 +1145,16 @@ async function transferTarFromPodOnce(
       try {
         socket?.close()
       } catch (closeError) {
-        core.debug(`[cpFromPod] closing the exec socket failed: ${errorText(closeError)}`)
+        core.debug(
+          `[cpFromPod] closing the exec socket failed: ${errorText(closeError)}`
+        )
       }
       if (failure === undefined) {
         resolve()
       } else {
-        reject(failure instanceof Error ? failure : new Error(errorText(failure)))
+        reject(
+          failure instanceof Error ? failure : new Error(errorText(failure))
+        )
       }
     }
 
@@ -1154,9 +1168,12 @@ async function transferTarFromPodOnce(
     // (tar-stream destroys the open entry with the same error). Directory
     // entries are not consumed by anyone, so without a listener that error
     // becomes an uncaught exception as well.
-    writerStream.on('entry', (_header: unknown, entryStream: stream.Readable) => {
-      entryStream.on('error', (entryError: Error) => settle(entryError))
-    })
+    writerStream.on(
+      'entry',
+      (_header: unknown, entryStream: stream.Readable) => {
+        entryStream.on('error', (entryError: Error) => settle(entryError))
+      }
+    )
 
     timer = setTimeout(() => {
       settle(
