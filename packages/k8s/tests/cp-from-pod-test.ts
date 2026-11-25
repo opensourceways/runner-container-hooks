@@ -71,6 +71,7 @@ describe('execCpFromPod', () => {
     delete process.env['HOOKS_SYNC_EXCLUDE']
     delete process.env['HOOKS_SYNC_MODE']
     delete process.env['HOOKS_SYNC_LISTEN_IP']
+    delete process.env['HOOKS_SYNC_DIRECT_MAX_FAILURES']
   })
 
   // Simulate a pod whose `/__w/_temp` is mirrored by a local fixture
@@ -238,6 +239,49 @@ describe('execCpFromPod', () => {
       fs.readFileSync(path.join(workDir, '_temp', 'secret.txt'), 'utf8')
     ).toBe('payload')
     expect(fs.readdirSync(workDir).sort()).toEqual(['_temp'])
+  })
+
+  it('disables direct mode after consecutive failures even when exec fallback succeeds', async () => {
+    process.env['HOOKS_SYNC_MODE'] = 'direct'
+    process.env['HOOKS_SYNC_LISTEN_IP'] = '127.0.0.1'
+    process.env['HOOKS_SYNC_DIRECT_MAX_FAILURES'] = '2'
+
+    const podTemp = path.join(podSideDir, '_temp')
+    fs.mkdirSync(podTemp, { recursive: true })
+    const payloadPath = path.join(podTemp, 'payload.txt')
+
+    const directAttempts = (): number =>
+      execSpy.mock.calls.filter(
+        call => (call[3] as string[])[0] === 'bash'
+      ).length
+
+    // Reset the module-level failure counter to zero with one successful
+    // direct transfer. Distinct sizes keep the unchanged-sync shortcut from
+    // skipping any of the transfers below.
+    mockPodSide()
+    fs.writeFileSync(payloadPath, 'a')
+    await execCpFromPod('test-pod', CONTAINER_TEMP, workDir)
+
+    // Two bad-token syncs: each attempts direct, fails, then falls back to
+    // exec successfully. The successful exec fallback must NOT reset the
+    // counter, or the disable-after-N guard would never trip.
+    mockPodSide({ badToken: true })
+    execSpy.mockClear()
+    fs.writeFileSync(payloadPath, 'bb')
+    await execCpFromPod('test-pod', CONTAINER_TEMP, workDir)
+    fs.writeFileSync(payloadPath, 'ccc')
+    await execCpFromPod('test-pod', CONTAINER_TEMP, workDir)
+    expect(directAttempts()).toBe(2)
+
+    // Third sync: the counter has reached the cap, so direct is skipped and
+    // the copy goes straight to exec.
+    execSpy.mockClear()
+    fs.writeFileSync(payloadPath, 'dddd')
+    await execCpFromPod('test-pod', CONTAINER_TEMP, workDir)
+    expect(
+      fs.readFileSync(path.join(workDir, '_temp', 'payload.txt'), 'utf8')
+    ).toBe('dddd')
+    expect(directAttempts()).toBe(0)
   })
 
   it('retries a truncated stream and publishes the complete copy', async () => {

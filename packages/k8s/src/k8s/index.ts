@@ -587,43 +587,75 @@ export async function execCpToPod(
   let attempt = 0
   while (true) {
     try {
-      const exec = new k8s.Exec(kc)
-      // Use tar to extract with --no-same-owner to avoid ownership issues.
-      // Then use find to fix permissions. The -m flag helps but we also need to fix permissions after.
-      const command = [
-        'sh',
-        '-c',
-        `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null; ` +
-          `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
-          `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
-          `sync 2>/dev/null || true`
-      ]
-      const readStream = tar.pack(runnerPath)
-      const errStream = new WritableStreamBuffer()
-      await new Promise((resolve, reject) => {
-        exec
-          .exec(
-            namespace(),
+      let directSucceeded = false
+      if (
+        syncModeIsDirect() &&
+        directSyncConsecutiveFailures < directSyncMaxFailures()
+      ) {
+        try {
+          await transferTarToPodDirectOnce(
             podName,
-            JOB_CONTAINER_NAME,
-            command,
-            null,
-            errStream,
-            readStream,
-            false,
-            async status => {
-              if (errStream.size()) {
-                reject(
-                  new Error(
-                    `Error from execCpToPod - status: ${status.status}, details: \n ${errStream.getContentsAsString()}`
-                  )
-                )
-              }
-              resolve(status)
-            }
+            runnerPath,
+            containerPath,
+            envPositiveInt(
+              'HOOKS_SYNC_DIRECT_TIMEOUT_MS',
+              CP_TO_POD_DIRECT_TIMEOUT_MS
+            )
           )
-          .catch(e => reject(e))
-      })
+          directSucceeded = true
+        } catch (directError) {
+          directSyncConsecutiveFailures++
+          core.warning(
+            `[cpToPod] direct pod-to-pod transfer failed (${errorText(directError)}); falling back to the exec channel`
+          )
+        }
+      }
+
+      if (!directSucceeded) {
+        const exec = new k8s.Exec(kc)
+        // Use tar to extract with --no-same-owner to avoid ownership issues.
+        // Then use find to fix permissions. The -m flag helps but we also need to fix permissions after.
+        const command = [
+          'sh',
+          '-c',
+          `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null; ` +
+            `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
+            `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
+            `sync 2>/dev/null || true`
+        ]
+        const readStream = tar.pack(runnerPath)
+        const errStream = new WritableStreamBuffer()
+        await new Promise((resolve, reject) => {
+          exec
+            .exec(
+              namespace(),
+              podName,
+              JOB_CONTAINER_NAME,
+              command,
+              null,
+              errStream,
+              readStream,
+              false,
+              async status => {
+                if (errStream.size()) {
+                  reject(
+                    new Error(
+                      `Error from execCpToPod - status: ${status.status}, details: \n ${errStream.getContentsAsString()}`
+                    )
+                  )
+                }
+                resolve(status)
+              }
+            )
+            .catch(e => reject(e))
+        })
+      }
+
+      // Only a successful *direct* transfer clears the failure streak; a
+      // successful exec fallback means the direct channel is still unhealthy.
+      if (directSucceeded) {
+        directSyncConsecutiveFailures = 0
+      }
       break
     } catch (error) {
       core.debug(`cpToPod: Attempt ${attempt + 1} failed: ${error}`)
@@ -1149,6 +1181,27 @@ function syncModeIsDirect(): boolean {
   )
 }
 
+function directSyncMaxFailures(): number {
+  return envPositiveInt(
+    'HOOKS_SYNC_DIRECT_MAX_FAILURES',
+    DIRECT_SYNC_MAX_CONSECUTIVE_FAILURES
+  )
+}
+
+// Constant-time comparison for the one-time handshake token, shared by both
+// transfer directions. Length is checked first so timingSafeEqual never sees
+// buffers of different sizes.
+function tokenMatchesHex(expected: string, received: string): boolean {
+  const expectedBuf = Buffer.from(expected, 'utf8')
+  const actualBuf = Buffer.from(received, 'utf8')
+  return (
+    actualBuf.length === expectedBuf.length &&
+    timingSafeEqual(expectedBuf, actualBuf)
+  )
+}
+
+const CP_TO_POD_DIRECT_TIMEOUT_MS = 15 * 60 * 1000
+
 function shQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
@@ -1400,6 +1453,197 @@ async function transferTarFromPodDirectOnce(
   }
 }
 
+// Reverse direction of transferTarFromPodDirectOnce: push a runner-side
+// directory into the job container without sending the tar payload through
+// the API server. The runner listens on its pod IP, exec only starts a small
+// bash command in the job container, and that container connects back over
+// the pod network, authenticates with a one-time token, then extracts the
+// streamed archive. The exec channel carries no payload bytes.
+async function transferTarToPodDirectOnce(
+  podName: string,
+  runnerPath: string,
+  containerPath: string,
+  timeoutMs: number
+): Promise<void> {
+  const listenAddress = await getSyncListenAddress()
+  const transferToken = randomBytes(16).toString('hex')
+
+  const server = net.createServer()
+  const sockets = new Set<net.Socket>()
+  let execSocket: { close: () => void } | undefined
+  let packStream: stream.Readable | undefined
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+    let execSucceeded = false
+    let streamFinished = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const settle = (failure?: unknown): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (timer) {
+        clearTimeout(timer)
+      }
+      try {
+        packStream?.destroy()
+      } catch (destroyError) {
+        core.debug(
+          `[cpToPod] destroying the pack stream failed: ${errorText(destroyError)}`
+        )
+      }
+      sockets.forEach(socket => {
+        try {
+          socket.destroy()
+        } catch (destroyError) {
+          core.debug(
+            `[cpToPod] destroying a direct-transfer socket failed: ${errorText(destroyError)}`
+          )
+        }
+      })
+      sockets.clear()
+      try {
+        server.close()
+      } catch (closeError) {
+        core.debug(
+          `[cpToPod] closing the direct-transfer listener failed: ${errorText(closeError)}`
+        )
+      }
+      try {
+        execSocket?.close()
+      } catch (closeError) {
+        core.debug(
+          `[cpToPod] closing the exec socket failed: ${errorText(closeError)}`
+        )
+      }
+      if (failure === undefined) {
+        resolve()
+      } else {
+        reject(
+          failure instanceof Error ? failure : new Error(errorText(failure))
+        )
+      }
+    }
+
+    // Both the pod-side extraction and the runner-side archive must finish.
+    const maybeSucceed = (): void => {
+      if (execSucceeded && streamFinished) {
+        settle()
+      }
+    }
+
+    timer = setTimeout(() => {
+      settle(new Error(`direct push timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+
+    server.on('error', serverError => settle(serverError))
+
+    server.on('connection', (socket: net.Socket) => {
+      if (sockets.size > 0) {
+        socket.destroy()
+        return
+      }
+      sockets.add(socket)
+
+      let pending = Buffer.alloc(0)
+      let authenticated = false
+
+      socket.on('error', socketError => settle(socketError))
+      socket.on('data', (chunk: Buffer) => {
+        if (authenticated) {
+          return
+        }
+        pending = Buffer.concat([pending, chunk])
+        const newline = pending.indexOf(0x0a)
+        if (newline === -1) {
+          if (pending.length > HANDSHAKE_MAX_BYTES) {
+            settle(new Error('direct push handshake exceeded its size limit'))
+          }
+          return
+        }
+        const received = pending.subarray(0, newline).toString('utf8')
+        if (!tokenMatchesHex(transferToken, received)) {
+          settle(new Error('direct push handshake carried an invalid token'))
+          return
+        }
+        authenticated = true
+        pending = Buffer.alloc(0)
+
+        // Authenticated: stream the runner-side directory to the pod.
+        const pack = tar.pack(runnerPath)
+        packStream = pack
+        pack.on('error', packError => settle(packError))
+        pack.on('data', (data: Buffer) => {
+          if (!socket.write(data)) {
+            pack.pause()
+          }
+        })
+        socket.on('drain', () => pack.resume())
+        pack.on('end', () => {
+          streamFinished = true
+          // Half-close so the pod-side `tar xf -` observes EOF.
+          socket.end()
+          maybeSucceed()
+        })
+      })
+    })
+
+    server.listen(0, listenAddress, () => {
+      const port = (server.address() as net.AddressInfo).port
+      const script =
+        `exec 3<>/dev/tcp/${listenAddress}/${port} || exit 1\n` +
+        `printf '%s\\n' ${shQuote(transferToken)} >&3\n` +
+        `tar xf - --no-same-owner -C ${shQuote(containerPath)} <&3 2>/dev/null; ` +
+        `find ${shQuote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
+        `find ${shQuote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
+        `sync 2>/dev/null || true`
+
+      const errStream = new WritableStreamBuffer()
+      new k8s.Exec(kc)
+        .exec(
+          namespace(),
+          podName,
+          JOB_CONTAINER_NAME,
+          ['bash', '-c', script],
+          null,
+          errStream,
+          null,
+          false,
+          (status: k8s.V1Status) => {
+            const details = errStream.size()
+              ? `: ${String(errStream.getContentsAsString()).trim()}`
+              : ''
+            if (status.status !== 'Success' || errStream.size()) {
+              settle(
+                new Error(
+                  `pod-side extraction exited with '${status.status}'${details}`
+                )
+              )
+              return
+            }
+            execSucceeded = true
+            maybeSucceed()
+          }
+        )
+        .then(webSocket => {
+          execSocket = webSocket
+          if (settled) {
+            try {
+              webSocket.close()
+            } catch (closeError) {
+              core.debug(
+                `[cpToPod] closing a late exec socket failed: ${errorText(closeError)}`
+              )
+            }
+          }
+        })
+        .catch(execError => settle(execError))
+    })
+  })
+}
+
 // Runs one transfer attempt. Resolves only after tar-fs finished flushing the
 // archive to disk; rejects on any stream error, stderr output, non-Success
 // exec status, timeout or transport failure.
@@ -1601,9 +1845,10 @@ export async function execCpFromPod(
     const attemptStartedAt = Date.now()
 
     try {
+      let directSucceeded = false
       if (
         syncModeIsDirect() &&
-        directSyncConsecutiveFailures < DIRECT_SYNC_MAX_CONSECUTIVE_FAILURES
+        directSyncConsecutiveFailures < directSyncMaxFailures()
       ) {
         try {
           await transferTarFromPodDirectOnce(
@@ -1614,6 +1859,7 @@ export async function execCpFromPod(
             Math.min(settings.attemptTimeoutMs, remainingMs),
             progress
           )
+          directSucceeded = true
         } catch (directError) {
           directSyncConsecutiveFailures++
           // The partial staging content from the failed direct attempt must
@@ -1642,7 +1888,13 @@ export async function execCpFromPod(
           progress
         )
       }
-      directSyncConsecutiveFailures = 0
+      // Only a successful *direct* transfer clears the failure streak. A
+      // fallback to exec means the direct channel is still unhealthy, so the
+      // counter must be retained; otherwise the disable-after-N guard never
+      // trips and every sync keeps paying for a failed direct attempt.
+      if (directSucceeded) {
+        directSyncConsecutiveFailures = 0
+      }
       totalBytes += progress.bytes
       const elapsed = Date.now() - attemptStartedAt
       core.debug(
