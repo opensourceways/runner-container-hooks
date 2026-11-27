@@ -83,10 +83,16 @@ describe('execCpFromPod', () => {
   // ends the stream without a terminal status, which is what a peer close on a
   // slow exec channel leaves behind.
   //
-  // `badToken` makes the direct-mode sender authenticate with the wrong token,
-  // which must be rejected before any byte reaches the staging directory.
+  // `probeConnections` opens unauthenticated connections before the real
+  // sender: they must be dropped without failing the transfer or evicting the
+  // real job connection. `failDirect` sends a valid token but a truncated
+  // archive, exercising the direct failure -> exec fallback path.
   function mockPodSide(
-    behavior: { truncateTransfers?: number; badToken?: boolean } = {}
+    behavior: {
+      truncateTransfers?: number
+      probeConnections?: number
+      failDirect?: boolean
+    } = {}
   ): void {
     let truncationsLeft = behavior.truncateTransfers ?? 0
     execSpy.mockImplementation(
@@ -124,16 +130,32 @@ describe('execCpFromPod', () => {
           const match = /\/dev\/tcp\/([^/\s]+)\/(\d+)/.exec(command[2])
           const token = /printf '%s\\n' '([0-9a-fA-F]+)'/.exec(command[2])
           if (match && token) {
-            const sentToken = behavior.badToken ? 'deadbeef' : token[1]
             const archive = await packToBuffer(podSideDir)
-            await new Promise<void>((resolve, reject) => {
+            // A scanner that connects with a bogus token and goes away.
+            for (let i = 0; i < (behavior.probeConnections ?? 0); i++) {
+              await new Promise<void>(resolve => {
+                const socket = net.connect(Number(match[2]), match[1], () => {
+                  socket.write('deadbeef\n')
+                })
+                socket.on('close', () => resolve())
+                socket.on('error', () => resolve())
+              })
+            }
+            await new Promise<void>(resolve => {
               const socket = net.connect(Number(match[2]), match[1], () => {
-                socket.write(`${sentToken}\n`)
-                socket.write(archive)
+                socket.write(`${token[1]}\n`)
+                socket.write(
+                  behavior.failDirect
+                    ? archive.subarray(
+                        0,
+                        Math.max(1, Math.floor(archive.length / 2))
+                      )
+                    : archive
+                )
                 socket.end()
               })
               socket.on('close', () => resolve())
-              socket.on('error', reject)
+              socket.on('error', () => resolve())
             })
             callback({ status: 'Success' })
             return Promise.resolve()
@@ -223,7 +245,7 @@ describe('execCpFromPod', () => {
     expect(fs.readdirSync(workDir).sort()).toEqual(['_temp'])
   })
 
-  it('rejects a direct connection with the wrong token and falls back to exec', async () => {
+  it('drops an unauthenticated probe connection without failing the direct transfer', async () => {
     process.env['HOOKS_SYNC_MODE'] = 'direct'
     process.env['HOOKS_SYNC_LISTEN_IP'] = '127.0.0.1'
 
@@ -231,7 +253,7 @@ describe('execCpFromPod', () => {
     fs.mkdirSync(podTemp, { recursive: true })
     fs.writeFileSync(path.join(podTemp, 'secret.txt'), 'payload')
 
-    mockPodSide({ badToken: true })
+    mockPodSide({ probeConnections: 1 })
 
     await execCpFromPod('test-pod', CONTAINER_TEMP, workDir)
 
@@ -239,6 +261,10 @@ describe('execCpFromPod', () => {
       fs.readFileSync(path.join(workDir, '_temp', 'secret.txt'), 'utf8')
     ).toBe('payload')
     expect(fs.readdirSync(workDir).sort()).toEqual(['_temp'])
+    // No exec fallback: a bad-token probe must not consume the attempt.
+    expect(
+      execSpy.mock.calls.filter(call => (call[3] as string[])[0] === 'tar')
+    ).toHaveLength(0)
   })
 
   it('disables direct mode after consecutive failures even when exec fallback succeeds', async () => {
@@ -251,9 +277,8 @@ describe('execCpFromPod', () => {
     const payloadPath = path.join(podTemp, 'payload.txt')
 
     const directAttempts = (): number =>
-      execSpy.mock.calls.filter(
-        call => (call[3] as string[])[0] === 'bash'
-      ).length
+      execSpy.mock.calls.filter(call => (call[3] as string[])[0] === 'bash')
+        .length
 
     // Reset the module-level failure counter to zero with one successful
     // direct transfer. Distinct sizes keep the unchanged-sync shortcut from
@@ -262,10 +287,10 @@ describe('execCpFromPod', () => {
     fs.writeFileSync(payloadPath, 'a')
     await execCpFromPod('test-pod', CONTAINER_TEMP, workDir)
 
-    // Two bad-token syncs: each attempts direct, fails, then falls back to
-    // exec successfully. The successful exec fallback must NOT reset the
-    // counter, or the disable-after-N guard would never trip.
-    mockPodSide({ badToken: true })
+    // Two truncated-direct syncs: each attempts direct, fails, then falls
+    // back to exec successfully. The successful exec fallback must NOT reset
+    // the counter, or the disable-after-N guard would never trip.
+    mockPodSide({ failDirect: true })
     execSpy.mockClear()
     fs.writeFileSync(payloadPath, 'bb')
     await execCpFromPod('test-pod', CONTAINER_TEMP, workDir)

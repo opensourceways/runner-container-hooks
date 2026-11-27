@@ -1173,6 +1173,8 @@ const DIRECT_SYNC_MAX_CONSECUTIVE_FAILURES = 2
 // Upper bound on the token line; the token itself is 32 hex characters, so
 // anything larger is either a bug or an attacker probing the port.
 const HANDSHAKE_MAX_BYTES = 128
+// Shared by both directions on purpose: a pod-to-pod transfer and the reverse
+// push use the same channel and the same failure budget for this process.
 let directSyncConsecutiveFailures = 0
 
 function syncModeIsDirect(): boolean {
@@ -1198,6 +1200,28 @@ function tokenMatchesHex(expected: string, received: string): boolean {
     actualBuf.length === expectedBuf.length &&
     timingSafeEqual(expectedBuf, actualBuf)
   )
+}
+
+// The listener binds to the pod IP, which any in-cluster client can reach.
+// Dropping an unauthenticated peer (instead of failing the whole attempt)
+// keeps a monitoring probe or security scanner from permanently disabling
+// direct mode with two accidental hits. The attempt-level timeout still
+// bounds how long a bad peer can hold the listener open.
+function dropUnauthenticatedSocket(
+  direction: 'cpFromPod' | 'cpToPod',
+  socket: net.Socket,
+  sockets: Set<net.Socket>,
+  reason: string
+): void {
+  core.debug(`[${direction}] dropping unauthenticated connection: ${reason}`)
+  sockets.delete(socket)
+  try {
+    socket.destroy()
+  } catch (destroyError) {
+    core.debug(
+      `[${direction}] destroying an unauthenticated socket failed: ${errorText(destroyError)}`
+    )
+  }
 }
 
 const CP_TO_POD_DIRECT_TIMEOUT_MS = 15 * 60 * 1000
@@ -1245,16 +1269,13 @@ async function transferTarFromPodDirectOnce(
   const errStream = new WritableStreamBuffer()
 
   const transferToken = randomBytes(16).toString('hex')
-  const tokenMatches = (received: string): boolean => {
-    const expected = Buffer.from(transferToken, 'utf8')
-    const actual = Buffer.from(received, 'utf8')
-    return (
-      actual.length === expected.length && timingSafeEqual(expected, actual)
-    )
-  }
 
   const server = net.createServer()
   const sockets = new Set<net.Socket>()
+  // Only one peer may feed the shared extract stream. Unauthenticated probes
+  // can arrive in parallel and are dropped individually without failing the
+  // attempt, so the real job connection is never displaced by a scanner.
+  let authenticatedSocket: net.Socket | undefined
   let execSocket: { close: () => void } | undefined
 
   try {
@@ -1322,20 +1343,38 @@ async function transferTarFromPodDirectOnce(
       }, timeoutMs)
 
       server.on('connection', (socket: net.Socket) => {
-        if (sockets.size > 0) {
-          socket.destroy()
+        if (authenticatedSocket) {
+          dropUnauthenticatedSocket(
+            'cpFromPod',
+            socket,
+            sockets,
+            'an authenticated connection already exists'
+          )
           return
         }
         sockets.add(socket)
+        socket.on('close', () => sockets.delete(socket))
 
         // The port is reachable by every pod in the cluster, so the first
         // bytes on the wire must be the one-time token handed to the job
-        // container through the exec command. Anything else is dropped before
-        // it can touch the staging directory.
+        // container through the exec command. A peer that fails to prove it
+        // is dropped; it must never fail the transfer or evict the real job
+        // connection from the listener.
         let pending = Buffer.alloc(0)
         let authenticated = false
 
-        socket.on('error', (socketError: Error) => settle(socketError))
+        socket.on('error', (socketError: Error) => {
+          if (authenticated) {
+            settle(socketError)
+          } else {
+            dropUnauthenticatedSocket(
+              'cpFromPod',
+              socket,
+              sockets,
+              `socket error: ${errorText(socketError)}`
+            )
+          }
+        })
         socket.on('data', (chunk: Buffer) => {
           if (authenticated) {
             if (!writerStream.write(chunk)) {
@@ -1347,32 +1386,41 @@ async function transferTarFromPodDirectOnce(
           const newline = pending.indexOf(0x0a)
           if (newline === -1) {
             if (pending.length > HANDSHAKE_MAX_BYTES) {
-              settle(
-                new Error('direct transfer handshake exceeded its size limit')
+              dropUnauthenticatedSocket(
+                'cpFromPod',
+                socket,
+                sockets,
+                'handshake exceeded its size limit'
               )
             }
             return
           }
           const received = pending.subarray(0, newline).toString('utf8')
           const remainder = pending.subarray(newline + 1)
-          if (!tokenMatches(received)) {
-            settle(
-              new Error('direct transfer handshake carried an invalid token')
+          if (!tokenMatchesHex(transferToken, received)) {
+            dropUnauthenticatedSocket(
+              'cpFromPod',
+              socket,
+              sockets,
+              'invalid token'
             )
             return
           }
           authenticated = true
+          authenticatedSocket = socket
           pending = Buffer.alloc(0)
+          writerStream.on('drain', () => socket.resume())
           if (remainder.length && !writerStream.write(remainder)) {
             socket.pause()
           }
         })
         socket.on('end', () => {
           if (!authenticated) {
-            settle(
-              new Error(
-                'direct transfer connection closed before authenticating'
-              )
+            dropUnauthenticatedSocket(
+              'cpFromPod',
+              socket,
+              sockets,
+              'connection closed before authenticating'
             )
             return
           }
@@ -1380,7 +1428,6 @@ async function transferTarFromPodDirectOnce(
           // flushed to disk; ending the extract stream is what starts that.
           writerStream.end()
         })
-        writerStream.on('drain', () => socket.resume())
       })
       server.on('error', (serverError: Error) => settle(serverError))
 
@@ -1470,6 +1517,9 @@ async function transferTarToPodDirectOnce(
 
   const server = net.createServer()
   const sockets = new Set<net.Socket>()
+  // As above: only the authenticated job connection may receive the tar
+  // stream; probes are dropped without consuming the transfer attempt.
+  let authenticatedSocket: net.Socket | undefined
   let execSocket: { close: () => void } | undefined
   let packStream: stream.Readable | undefined
 
@@ -1541,16 +1591,33 @@ async function transferTarToPodDirectOnce(
     server.on('error', serverError => settle(serverError))
 
     server.on('connection', (socket: net.Socket) => {
-      if (sockets.size > 0) {
-        socket.destroy()
+      if (authenticatedSocket) {
+        dropUnauthenticatedSocket(
+          'cpToPod',
+          socket,
+          sockets,
+          'an authenticated connection already exists'
+        )
         return
       }
       sockets.add(socket)
+      socket.on('close', () => sockets.delete(socket))
 
       let pending = Buffer.alloc(0)
       let authenticated = false
 
-      socket.on('error', socketError => settle(socketError))
+      socket.on('error', socketError => {
+        if (authenticated) {
+          settle(socketError)
+        } else {
+          dropUnauthenticatedSocket(
+            'cpToPod',
+            socket,
+            sockets,
+            `socket error: ${errorText(socketError)}`
+          )
+        }
+      })
       socket.on('data', (chunk: Buffer) => {
         if (authenticated) {
           return
@@ -1559,16 +1626,22 @@ async function transferTarToPodDirectOnce(
         const newline = pending.indexOf(0x0a)
         if (newline === -1) {
           if (pending.length > HANDSHAKE_MAX_BYTES) {
-            settle(new Error('direct push handshake exceeded its size limit'))
+            dropUnauthenticatedSocket(
+              'cpToPod',
+              socket,
+              sockets,
+              'handshake exceeded its size limit'
+            )
           }
           return
         }
         const received = pending.subarray(0, newline).toString('utf8')
         if (!tokenMatchesHex(transferToken, received)) {
-          settle(new Error('direct push handshake carried an invalid token'))
+          dropUnauthenticatedSocket('cpToPod', socket, sockets, 'invalid token')
           return
         }
         authenticated = true
+        authenticatedSocket = socket
         pending = Buffer.alloc(0)
 
         // Authenticated: stream the runner-side directory to the pod.
