@@ -614,20 +614,25 @@ export async function execCpToPod(
       if (!directSucceeded) {
         const exec = new k8s.Exec(kc)
         // Use tar to extract with --no-same-owner to avoid ownership issues.
-        // Then use find to fix permissions. The -m flag helps but we also need to fix permissions after.
-        // A failed tar must not be masked by the trailing `sync || true`:
-        // surfacing the exit code lets the retry loop re-transfer instead of
-        // leaving a partial extraction behind unnoticed.
-        // `--no-same-permissions --no-overwrite-dir` keeps tar from touching
-        // the target mount point's metadata (/__w): utime/chmod on it fails
-        // with EPERM for the non-root runner user, which used to exit
-        // non-zero AFTER a complete extraction. The find/chmod steps below
-        // still fix up the permissions the workflow needs.
+        // Then use find to fix permissions.
+        //
+        // A failed tar must not be masked: without the exit-code check a torn
+        // stream leaves a partial extraction behind unnoticed. But the
+        // failure is only fatal when the DATA is bad: on real clusters the
+        // job container extracts into the /__w mount point as a non-root
+        // user, and tar exits non-zero AFTER a complete extraction because
+        // it cannot restore the mount point's own metadata (utime/chmod
+        // EPERM). The root directory's entry is the only thing that failed,
+        // so the listing verification below still proves the content. The
+        // stderr blocklist treats IO/data/option errors as fatal while
+        // tolerating metadata-only failures; the image may ship GNU tar or
+        // busybox tar, so only --no-same-owner is assumed.
         const command = [
           'sh',
           '-c',
-          `tar xf - --no-same-owner --no-same-permissions --no-overwrite-dir ` +
-            `-C ${shlex.quote(containerPath)} 2>/dev/null || exit 1; ` +
+          `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/tmp/.hooks-tar.err || { ` +
+            `if grep -qE 'Cannot read|unexpected|unrecognized|No such|short read|Cannot open|EOF' /tmp/.hooks-tar.err 2>/dev/null; then ` +
+            `rm -f /tmp/.hooks-tar.err; exit 1; fi; rm -f /tmp/.hooks-tar.err; }; ` +
             `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
             `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
             `sync 2>/dev/null || true`
@@ -1739,13 +1744,14 @@ async function transferTarToPodDirectOnce(
         // A failed extraction must not be masked by the trailing `sync || true`:
         // exiting non-zero surfaces the failure through the exec status, so the
         // caller falls back to the exec channel instead of trusting a torn copy.
-        // `--no-same-permissions --no-overwrite-dir` keeps tar from touching
-        // the target mount point's metadata (/__w): utime/chmod on it fails
-        // with EPERM for the non-root runner user, which used to exit non-zero
-        // after a COMPLETE extraction; the find/chmod steps below still fix
-        // up the permissions the workflow needs.
-        `tar xf - --no-same-owner --no-same-permissions --no-overwrite-dir ` +
-        `-C ${shQuote(containerPath)} <&3 2>/dev/null || exit 1; ` +
+        // Metadata-only failures on the /__w mount point (utime/chmod EPERM
+        // for the non-root runner user, after a COMPLETE extraction) are
+        // tolerated; the blocklist is the same as the exec fallback path —
+        // see that comment. Only --no-same-owner is assumed because the job
+        // image may ship busybox tar instead of GNU tar.
+        `tar xf - --no-same-owner -C ${shQuote(containerPath)} <&3 2>/tmp/.hooks-tar.err || { ` +
+        `if grep -qE 'Cannot read|unexpected|unrecognized|No such|short read|Cannot open|EOF' /tmp/.hooks-tar.err 2>/dev/null; then ` +
+        `rm -f /tmp/.hooks-tar.err; exit 1; fi; rm -f /tmp/.hooks-tar.err; }; ` +
         `find ${shQuote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
         `find ${shQuote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
         `sync 2>/dev/null || true`
