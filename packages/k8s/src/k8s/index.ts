@@ -590,7 +590,7 @@ export async function execCpToPod(
       let directSucceeded = false
       if (
         syncModeIsDirect() &&
-        directSyncConsecutiveFailures < directSyncMaxFailures()
+        directSyncToPodConsecutiveFailures < directSyncMaxFailures()
       ) {
         try {
           await transferTarToPodDirectOnce(
@@ -604,7 +604,7 @@ export async function execCpToPod(
           )
           directSucceeded = true
         } catch (directError) {
-          directSyncConsecutiveFailures++
+          directSyncToPodConsecutiveFailures++
           core.warning(
             `[cpToPod] direct pod-to-pod transfer failed (${errorText(directError)}); falling back to the exec channel`
           )
@@ -615,10 +615,13 @@ export async function execCpToPod(
         const exec = new k8s.Exec(kc)
         // Use tar to extract with --no-same-owner to avoid ownership issues.
         // Then use find to fix permissions. The -m flag helps but we also need to fix permissions after.
+        // A failed tar must not be masked by the trailing `sync || true`:
+        // surfacing the exit code lets the retry loop re-transfer instead of
+        // leaving a partial extraction behind unnoticed.
         const command = [
           'sh',
           '-c',
-          `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null; ` +
+          `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null || exit 1; ` +
             `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
             `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
             `sync 2>/dev/null || true`
@@ -654,7 +657,7 @@ export async function execCpToPod(
       // Only a successful *direct* transfer clears the failure streak; a
       // successful exec fallback means the direct channel is still unhealthy.
       if (directSucceeded) {
-        directSyncConsecutiveFailures = 0
+        directSyncToPodConsecutiveFailures = 0
       }
       break
     } catch (error) {
@@ -671,6 +674,7 @@ export async function execCpToPod(
 
   let attempts = 15
   const delay = 1000
+  let verified = false
   for (let i = 0; i < attempts; i++) {
     try {
       const { hash: want, lines: wantLines } =
@@ -722,11 +726,21 @@ export async function execCpToPod(
         continue
       }
 
+      verified = true
       break
     } catch (error) {
       core.debug(`Attempt ${i + 1} failed: ${error}`)
       await sleep(delay)
     }
+  }
+
+  if (!verified) {
+    // Mirrors the cpFromPod handling: the transfer itself reported success,
+    // but the listing never converged. Surface it instead of silently
+    // accepting a possibly torn pod-side copy.
+    core.warning(
+      `[cpToPod] listing verification did not converge for ${containerPath} after ${attempts} attempts; the pod-side copy may be incomplete or torn`
+    )
   }
 }
 
@@ -1173,9 +1187,10 @@ const DIRECT_SYNC_MAX_CONSECUTIVE_FAILURES = 2
 // Upper bound on the token line; the token itself is 32 hex characters, so
 // anything larger is either a bug or an attacker probing the port.
 const HANDSHAKE_MAX_BYTES = 128
-// Shared by both directions on purpose: a pod-to-pod transfer and the reverse
-// push use the same channel and the same failure budget for this process.
-let directSyncConsecutiveFailures = 0
+// Per-direction budgets: a failing direction must not spend the other
+// direction's direct attempts. Both counters live for the whole hook process.
+let directSyncFromPodConsecutiveFailures = 0
+let directSyncToPodConsecutiveFailures = 0
 
 function syncModeIsDirect(): boolean {
   return (
@@ -1243,6 +1258,12 @@ async function getSyncListenAddress(): Promise<string> {
     throw new Error('the runner pod has no podIP yet')
   }
   return podIP
+}
+
+// bash /dev/tcp needs brackets around IPv6 literals; Node's net.listen takes
+// the raw address, so only the script side gets the brackets.
+function devTcpAddress(address: string): string {
+  return address.includes(':') ? `[${address}]` : address
 }
 
 // Runs one direct transfer attempt: the runner pod listens on an ephemeral
@@ -1353,7 +1374,6 @@ async function transferTarFromPodDirectOnce(
           return
         }
         sockets.add(socket)
-        socket.on('close', () => sockets.delete(socket))
 
         // The port is reachable by every pod in the cluster, so the first
         // bytes on the wire must be the one-time token handed to the job
@@ -1362,6 +1382,7 @@ async function transferTarFromPodDirectOnce(
         // connection from the listener.
         let pending = Buffer.alloc(0)
         let authenticated = false
+        let archiveEnded = false
 
         socket.on('error', (socketError: Error) => {
           if (authenticated) {
@@ -1372,6 +1393,19 @@ async function transferTarFromPodDirectOnce(
               socket,
               sockets,
               `socket error: ${errorText(socketError)}`
+            )
+          }
+        })
+        socket.on('close', () => {
+          sockets.delete(socket)
+          // A connection that dies without 'error'/'end' (some half-close
+          // sequences) would otherwise leave the extract stream open and the
+          // attempt hanging until the full attempt timeout.
+          if (authenticated && !archiveEnded && !settled) {
+            settle(
+              new Error(
+                'authenticated connection closed before the archive completed'
+              )
             )
           }
         })
@@ -1424,6 +1458,7 @@ async function transferTarFromPodDirectOnce(
             )
             return
           }
+          archiveEnded = true
           // tar-stream settles the attempt on 'finish' once the archive is
           // flushed to disk; ending the extract stream is what starts that.
           writerStream.end()
@@ -1439,7 +1474,7 @@ async function transferTarFromPodDirectOnce(
         // `exec 3<>` keeps a single descriptor for the token and the archive,
         // so the handshake and the payload share one connection.
         const script =
-          `exec 3<>/dev/tcp/${listenAddress}/${port} || exit 1\n` +
+          `exec 3<>/dev/tcp/${devTcpAddress(listenAddress)}/${port} || exit 1\n` +
           `printf '%s\\n' ${shQuote(transferToken)} >&3\n` +
           `exec tar cf - ${excludeArgs ? `${excludeArgs} ` : ''}` +
           `-C ${shQuote(parentDir)} ${shQuote(dirname)} >&3`
@@ -1601,7 +1636,6 @@ async function transferTarToPodDirectOnce(
         return
       }
       sockets.add(socket)
-      socket.on('close', () => sockets.delete(socket))
 
       let pending = Buffer.alloc(0)
       let authenticated = false
@@ -1615,6 +1649,21 @@ async function transferTarToPodDirectOnce(
             socket,
             sockets,
             `socket error: ${errorText(socketError)}`
+          )
+        }
+      })
+      socket.on('close', () => {
+        sockets.delete(socket)
+        // A connection that goes away without an error event would otherwise
+        // leave the pack stream pushing into a dead socket while the attempt
+        // waits on the exec status until the full attempt timeout. Once the
+        // archive finished sending, the peer closing is part of the normal
+        // flow and must not fail the attempt.
+        if (authenticated && !streamFinished && !settled) {
+          settle(
+            new Error(
+              'authenticated connection closed before the archive finished sending'
+            )
           )
         }
       })
@@ -1666,9 +1715,12 @@ async function transferTarToPodDirectOnce(
     server.listen(0, listenAddress, () => {
       const port = (server.address() as net.AddressInfo).port
       const script =
-        `exec 3<>/dev/tcp/${listenAddress}/${port} || exit 1\n` +
+        `exec 3<>/dev/tcp/${devTcpAddress(listenAddress)}/${port} || exit 1\n` +
         `printf '%s\\n' ${shQuote(transferToken)} >&3\n` +
-        `tar xf - --no-same-owner -C ${shQuote(containerPath)} <&3 2>/dev/null; ` +
+        // A failed extraction must not be masked by the trailing `sync || true`:
+        // exiting non-zero surfaces the failure through the exec status, so the
+        // caller falls back to the exec channel instead of trusting a torn copy.
+        `tar xf - --no-same-owner -C ${shQuote(containerPath)} <&3 2>/dev/null || exit 1; ` +
         `find ${shQuote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
         `find ${shQuote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
         `sync 2>/dev/null || true`
@@ -1921,7 +1973,7 @@ export async function execCpFromPod(
       let directSucceeded = false
       if (
         syncModeIsDirect() &&
-        directSyncConsecutiveFailures < directSyncMaxFailures()
+        directSyncFromPodConsecutiveFailures < directSyncMaxFailures()
       ) {
         try {
           await transferTarFromPodDirectOnce(
@@ -1934,7 +1986,7 @@ export async function execCpFromPod(
           )
           directSucceeded = true
         } catch (directError) {
-          directSyncConsecutiveFailures++
+          directSyncFromPodConsecutiveFailures++
           // The partial staging content from the failed direct attempt must
           // not be mixed with the fallback transfer.
           removeSyncDirectory(stagingRoot)
@@ -1966,7 +2018,7 @@ export async function execCpFromPod(
       // counter must be retained; otherwise the disable-after-N guard never
       // trips and every sync keeps paying for a failed direct attempt.
       if (directSucceeded) {
-        directSyncConsecutiveFailures = 0
+        directSyncFromPodConsecutiveFailures = 0
       }
       totalBytes += progress.bytes
       const elapsed = Date.now() - attemptStartedAt
@@ -2097,9 +2149,11 @@ export async function execCpFromPod(
   // operation. Readers see either the complete old snapshot or the complete
   // new one; the only missing-file window is between the two renames below.
   removeSyncDirectory(trashPath)
+  let previousSnapshotInTrash = false
   if (fs.existsSync(targetRunnerPath)) {
     try {
       fs.renameSync(targetRunnerPath, trashPath)
+      previousSnapshotInTrash = true
     } catch (error) {
       core.debug(
         `rename of previous target to trash failed, falling back to rm: ${JSON.stringify(error)}`
@@ -2107,7 +2161,26 @@ export async function execCpFromPod(
       fs.rmSync(targetRunnerPath, { recursive: true, force: true })
     }
   }
-  fs.renameSync(stagingPath, targetRunnerPath)
+  try {
+    fs.renameSync(stagingPath, targetRunnerPath)
+  } catch (renameError) {
+    // The old snapshot now sits in the trash directory while the target is
+    // missing. Restore it so the next sync cannot wipe the last good copy,
+    // then rethrow: the publish failed and the caller must know.
+    if (previousSnapshotInTrash && !fs.existsSync(targetRunnerPath)) {
+      try {
+        fs.renameSync(trashPath, targetRunnerPath)
+        core.warning(
+          `execCpFromPod: publishing ${stagingPath} failed; the previous snapshot was restored from ${trashPath} (${errorText(renameError)})`
+        )
+      } catch (restoreError) {
+        core.error(
+          `execCpFromPod: publishing failed and restoring the previous snapshot from ${trashPath} also failed; the old copy is preserved there (${errorText(restoreError)})`
+        )
+      }
+    }
+    throw renameError
+  }
   removeSyncDirectory(stagingRoot)
   removeSyncDirectory(trashPath)
 
