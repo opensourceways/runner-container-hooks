@@ -618,10 +618,13 @@ export async function execCpToPod(
         // A failed tar must not be masked by the trailing `sync || true`:
         // surfacing the exit code lets the retry loop re-transfer instead of
         // leaving a partial extraction behind unnoticed.
+        // `--omit-dir-times --no-same-permissions` keeps tar from touching the
+        // target mount point itself; see the direct-path comment above.
         const command = [
           'sh',
           '-c',
-          `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null || exit 1; ` +
+          `tar xf - --no-same-owner --omit-dir-times --no-same-permissions ` +
+            `-C ${shlex.quote(containerPath)} 2>/dev/null || exit 1; ` +
             `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
             `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
             `sync 2>/dev/null || true`
@@ -1720,7 +1723,13 @@ async function transferTarToPodDirectOnce(
         // A failed extraction must not be masked by the trailing `sync || true`:
         // exiting non-zero surfaces the failure through the exec status, so the
         // caller falls back to the exec channel instead of trusting a torn copy.
-        `tar xf - --no-same-owner -C ${shQuote(containerPath)} <&3 2>/dev/null || exit 1; ` +
+        // `--omit-dir-times --no-same-permissions` keeps tar from touching the
+        // target mount point itself (/__w): utime/chmod on it fails with
+        // EPERM for the non-root runner user, which used to exit non-zero
+        // after a COMPLETE extraction; the find/chmod steps below still fix
+        // up the permissions the workflow needs.
+        `tar xf - --no-same-owner --omit-dir-times --no-same-permissions ` +
+        `-C ${shQuote(containerPath)} <&3 2>/dev/null || exit 1; ` +
         `find ${shQuote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
         `find ${shQuote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
         `sync 2>/dev/null || true`
