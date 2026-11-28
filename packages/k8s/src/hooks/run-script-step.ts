@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-unused-vars */
 import * as fs from 'fs'
 import * as core from '@actions/core'
 import { RunScriptStepArgs } from 'hooklib'
@@ -111,6 +110,10 @@ export async function runScriptStep(
     )
     await execCpFromPod(state.jobPod, containerTemp, workdir)
   } catch (error) {
-    core.warning('Failed to copy _temp from pod')
+    const message = error instanceof Error ? error.message : String(error)
+    core.warning(`Failed to copy _temp from pod: ${message}`)
+    // Surface the failure as a readable hook error instead of letting the
+    // transfer error escape as an uncaught exception.
+    throw new Error(`failed to sync /__w/_temp from the job pod: ${message}`)
   }
 }

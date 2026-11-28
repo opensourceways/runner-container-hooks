@@ -1,14 +1,16 @@
 import * as core from '@actions/core'
 import * as fs from 'fs'
 import * as path from 'path'
+import * as net from 'net'
 import { spawn } from 'child_process'
 import * as k8s from '@kubernetes/client-node'
 import tar from 'tar-fs'
 import * as stream from 'stream'
 import { WritableStreamBuffer } from 'stream-buffers'
-import { createHash } from 'crypto'
+import { createHash, randomBytes, timingSafeEqual } from 'crypto'
 import type { ContainerInfo, Registry } from 'hooklib'
 import {
+  getRunnerPodName,
   getSecretName,
   JOB_CONTAINER_NAME,
   RunnerInstanceLabel
@@ -575,6 +577,66 @@ export async function localCalculateOutputHashSorted(
   )
 }
 
+// Patterns in pod-side tar stderr that mark a REAL extraction failure —
+// bad archive data, IO errors, unrecognized options — as opposed to the
+// metadata-only failures tolerated below. Compared case-insensitively:
+// GNU tar and busybox tar capitalize their messages differently, and a
+// corrupt archive shows up as either "unexpected EOF" or "does not look
+// like a tar archive" depending on where the damage is.
+const TAR_FATAL_STDERR_PATTERN =
+  'Cannot read|unexpected|unrecognized|No such|short read|Cannot open|EOF|does not look like a tar archive'
+
+// Builds the pod-side `sh -c` script that extracts the archive arriving on
+// stdin into `containerPath` and fixes up permissions. Shared by the exec
+// fallback and the direct to-pod script so the stderr classification and
+// the chmod/sync steps cannot drift apart.
+//
+// Failure handling: a failed tar must not be masked by the trailing
+// `sync || true`. But the failure is only fatal when the DATA is bad: on
+// real clusters the job container extracts into the /__w mount point as a
+// non-root user and tar exits non-zero AFTER a complete extraction because
+// it cannot restore the mount point's own metadata (utime/chmod EPERM).
+// The stderr blocklist treats IO/data/option errors as fatal — surfacing
+// tar's stderr through the exec channel before exiting — while tolerating
+// the metadata-only failures; the listing verification still proves the
+// content. Only --no-same-owner is assumed because the job image may ship
+// busybox tar.
+//
+// The stderr goes to /tmp/.hooks-tar.err so fatal vs tolerated can be told
+// apart. A job container with readOnlyRootFilesystem has no writable /tmp:
+// that redirection would fail before tar even runs and break workflows
+// that worked with plain 2>/dev/null, so the script probes writability
+// first and falls back to discarding stderr entirely — all non-zero exits
+// are then tolerated and the listing verification throw is the safety net.
+// `stdinRedirect` is '' when the archive arrives on the exec stdin pipe or
+// '<&3' on the direct channel.
+export function podExtractScript(
+  containerPath: string,
+  stdinRedirect: string
+): string {
+  const errFile = '/tmp/.hooks-tar.err'
+  const stdinPart = stdinRedirect ? ` ${stdinRedirect}` : ''
+  const tarCommand = `tar xf - --no-same-owner -C ${shlex.quote(containerPath)}${stdinPart}`
+  const fixup =
+    `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
+    `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
+    `sync 2>/dev/null || true`
+  return (
+    // A subshell probe: a read-only rootfs fails the redirection inside
+    // the subshell only, and the outer script keeps running.
+    `if (true 2>${errFile}) 2>/dev/null; then\n` +
+    `${tarCommand} 2>${errFile} || { ` +
+    `if grep -qEi '${TAR_FATAL_STDERR_PATTERN}' ${errFile} 2>/dev/null; then ` +
+    // Surface tar's stderr with the failure before removing the file:
+    // a bare exit code is not enough to debug a broken transfer.
+    `echo 'tar extraction failed:' >&2; cat ${errFile} >&2; rm -f ${errFile}; exit 1; fi; rm -f ${errFile}; }\n` +
+    `else\n` +
+    `${tarCommand} 2>/dev/null || true\n` +
+    `fi\n` +
+    fixup
+  )
+}
+
 export async function execCpToPod(
   podName: string,
   runnerPath: string,
@@ -585,43 +647,82 @@ export async function execCpToPod(
   let attempt = 0
   while (true) {
     try {
-      const exec = new k8s.Exec(kc)
-      // Use tar to extract with --no-same-owner to avoid ownership issues.
-      // Then use find to fix permissions. The -m flag helps but we also need to fix permissions after.
-      const command = [
-        'sh',
-        '-c',
-        `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null; ` +
-          `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
-          `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
-          `sync 2>/dev/null || true`
-      ]
-      const readStream = tar.pack(runnerPath)
-      const errStream = new WritableStreamBuffer()
-      await new Promise((resolve, reject) => {
-        exec
-          .exec(
-            namespace(),
+      let directSucceeded = false
+      if (
+        syncModeIsDirect() &&
+        directSyncToPodConsecutiveFailures < directSyncMaxFailures()
+      ) {
+        try {
+          await transferTarToPodDirectOnce(
             podName,
-            JOB_CONTAINER_NAME,
-            command,
-            null,
-            errStream,
-            readStream,
-            false,
-            async status => {
-              if (errStream.size()) {
-                reject(
-                  new Error(
-                    `Error from execCpToPod - status: ${status.status}, details: \n ${errStream.getContentsAsString()}`
-                  )
-                )
-              }
-              resolve(status)
-            }
+            runnerPath,
+            containerPath,
+            envPositiveInt(
+              'HOOKS_SYNC_DIRECT_TIMEOUT_MS',
+              CP_TO_POD_DIRECT_TIMEOUT_MS
+            )
           )
-          .catch(e => reject(e))
-      })
+          directSucceeded = true
+        } catch (directError) {
+          directSyncToPodConsecutiveFailures++
+          core.warning(
+            `[cpToPod] direct pod-to-pod transfer failed (${errorText(directError)}); falling back to the exec channel`
+          )
+        }
+      }
+
+      if (!directSucceeded) {
+        const exec = new k8s.Exec(kc)
+        // Use tar to extract with --no-same-owner to avoid ownership issues.
+        // Then use find to fix permissions. The extraction script is shared
+        // with the direct to-pod path (podExtractScript) so the tar failure
+        // classification — fatal data/IO errors vs tolerated mount-point
+        // metadata failures — and the read-only-rootfs fallback stay in sync.
+        const command = ['sh', '-c', podExtractScript(containerPath, '')]
+        const readStream = tar.pack(runnerPath)
+        const errStream = new WritableStreamBuffer()
+        await new Promise((resolve, reject) => {
+          exec
+            .exec(
+              namespace(),
+              podName,
+              JOB_CONTAINER_NAME,
+              command,
+              null,
+              errStream,
+              readStream,
+              false,
+              async status => {
+                if (errStream.size()) {
+                  reject(
+                    new Error(
+                      `Error from execCpToPod - status: ${status.status}, details: \n ${errStream.getContentsAsString()}`
+                    )
+                  )
+                } else if (status.status !== 'Success') {
+                  // A non-zero pod-side exit (tar extraction failed) used to
+                  // resolve here unnoticed, leaving a torn or empty target
+                  // behind while the caller reported success. Reject so the
+                  // retry loop re-transfers.
+                  reject(
+                    new Error(
+                      `execCpToPod: pod-side extraction exited with status '${status.status}'`
+                    )
+                  )
+                } else {
+                  resolve(status)
+                }
+              }
+            )
+            .catch(e => reject(e))
+        })
+      }
+
+      // Only a successful *direct* transfer clears the failure streak; a
+      // successful exec fallback means the direct channel is still unhealthy.
+      if (directSucceeded) {
+        directSyncToPodConsecutiveFailures = 0
+      }
       break
     } catch (error) {
       core.debug(`cpToPod: Attempt ${attempt + 1} failed: ${error}`)
@@ -637,6 +738,7 @@ export async function execCpToPod(
 
   let attempts = 15
   const delay = 1000
+  let verified = false
   for (let i = 0; i < attempts; i++) {
     try {
       const { hash: want, lines: wantLines } =
@@ -688,12 +790,1175 @@ export async function execCpToPod(
         continue
       }
 
+      verified = true
       break
     } catch (error) {
       core.debug(`Attempt ${i + 1} failed: ${error}`)
       await sleep(delay)
     }
   }
+
+  if (!verified) {
+    // The transfer itself reported success, but the listing never converged:
+    // the pod-side copy is missing files, has extra files, or is torn, and
+    // nothing re-transfers it. Publishing that would silently produce a
+    // broken workspace downstream, so fail the step instead of the previous
+    // silent pass-through.
+    throw new Error(
+      `execCpToPod: listing verification did not converge for ${containerPath} after ${attempts} attempts; the pod-side copy is incomplete or torn`
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// execCpFromPod transfer resilience
+//
+// The pod-to-runner sync streams a tar archive over the k8s exec channel. On
+// nodes without a locally installed runner that channel can be very slow
+// (~0.13 MiB/s) and the peer closes it after a while, leaving a truncated tar
+// stream. tar-stream reports that asynchronously through `error`
+// ("Unexpected end of data"); without a listener it becomes an uncaught
+// exception that kills the hook process. The helpers below turn every
+// transfer failure into a retryable rejection, bound each attempt and the
+// whole sync, and make sure only a completely extracted staging directory is
+// ever published.
+// ---------------------------------------------------------------------------
+
+const CP_FROM_POD_MAX_ATTEMPTS = 5
+const CP_FROM_POD_BACKOFF_BASE_MS = 1000
+const CP_FROM_POD_BACKOFF_MAX_MS = 30 * 1000
+const CP_FROM_POD_ATTEMPT_TIMEOUT_MS = 15 * 60 * 1000
+const CP_FROM_POD_DEADLINE_MS = 2 * 60 * 60 * 1000
+const CP_FROM_POD_SLOW_WARN_MS = 60 * 1000
+const CP_FROM_POD_TRUNCATION_PATTERN =
+  /unexpected end of (data|file)|premature close|unexpected eof|truncated|socket hang up|ECONNRESET|aborted/i
+
+interface CpFromPodSettings {
+  maxAttempts: number
+  backoffBaseMs: number
+  backoffMaxMs: number
+  attemptTimeoutMs: number
+  deadlineMs: number
+  slowWarnMs: number
+  excludePatterns: string[]
+  excludeMatchers: RegExp[]
+}
+
+interface TransferProgress {
+  bytes: number
+}
+
+interface SyncDirectorySignature {
+  files: number
+  bytes: number
+  latestMtimeSeconds: number
+}
+
+interface LocalSyncEntry {
+  rel: string
+  size: number
+  mtimeSeconds: number
+}
+
+function envPositiveInt(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (!raw) {
+    return fallback
+  }
+  const value = parseInt(raw, 10)
+  return isNaN(value) || value <= 0 ? fallback : value
+}
+
+function cpFromPodSettings(): CpFromPodSettings {
+  const excludePatterns = (process.env['HOOKS_SYNC_EXCLUDE'] || '')
+    .split(',')
+    .map(pattern => pattern.trim().replace(/^\.\//, ''))
+    .filter(pattern => pattern.length > 0)
+  return {
+    maxAttempts: envPositiveInt(
+      'HOOKS_SYNC_MAX_ATTEMPTS',
+      CP_FROM_POD_MAX_ATTEMPTS
+    ),
+    backoffBaseMs: envPositiveInt(
+      'HOOKS_SYNC_BACKOFF_BASE_MS',
+      CP_FROM_POD_BACKOFF_BASE_MS
+    ),
+    backoffMaxMs: envPositiveInt(
+      'HOOKS_SYNC_BACKOFF_MAX_MS',
+      CP_FROM_POD_BACKOFF_MAX_MS
+    ),
+    attemptTimeoutMs: envPositiveInt(
+      'HOOKS_SYNC_ATTEMPT_TIMEOUT_MS',
+      CP_FROM_POD_ATTEMPT_TIMEOUT_MS
+    ),
+    deadlineMs: envPositiveInt(
+      'HOOKS_SYNC_DEADLINE_MS',
+      CP_FROM_POD_DEADLINE_MS
+    ),
+    slowWarnMs: envPositiveInt(
+      'HOOKS_SYNC_SLOW_WARN_MS',
+      CP_FROM_POD_SLOW_WARN_MS
+    ),
+    excludePatterns,
+    excludeMatchers: excludePatterns.map(pattern => globToRegExp(pattern))
+  }
+}
+
+// Converts a comma-separated exclude glob (relative to the synced directory)
+// into a matcher that also covers everything below a matched directory.
+function globToRegExp(glob: string): RegExp {
+  const normalized = glob.replace(/^\.\//, '')
+  let source = ''
+  for (let i = 0; i < normalized.length; i++) {
+    const char = normalized[i]
+    if (char === '*') {
+      if (normalized[i + 1] === '*') {
+        source += '.*'
+        i++
+        if (normalized[i + 1] === '/') {
+          i++
+        }
+      } else {
+        source += '[^/]*'
+      }
+    } else if (char === '?') {
+      source += '[^/]'
+    } else if ('.+^${}()|[]\\'.includes(char)) {
+      source += `\\${char}`
+    } else {
+      source += char
+    }
+  }
+  // A pattern without a slash matches a path component at any depth, the same
+  // way `tar --exclude` treats it. Patterns with a slash are relative to the
+  // synced directory.
+  const anchor = normalized.includes('/') ? '^(?:\\./)?' : '(?:^|/)'
+  return new RegExp(`${anchor}${source}(?:/.*)?$`)
+}
+
+function isExcludedSyncPath(relPath: string, matchers: RegExp[]): boolean {
+  if (matchers.length === 0) {
+    return false
+  }
+  const normalized = relPath.replace(/^\.\//, '')
+  for (const matcher of matchers) {
+    if (matcher.test(normalized)) {
+      return true
+    }
+  }
+  return false
+}
+
+function hashSortedListing(lines: string[]): string {
+  const sorted = lines
+    .slice()
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
+  const hash = createHash('sha256')
+  hash.update(`${sorted.join('\n')}\n`)
+  return hash.digest('hex')
+}
+
+function listingName(line: string): string {
+  const separator = line.indexOf(' ')
+  return separator === -1 ? line : line.slice(separator + 1)
+}
+
+function filterExcludedListing(lines: string[], matchers: RegExp[]): string[] {
+  if (matchers.length === 0) {
+    return lines
+  }
+  return lines.filter(line => !isExcludedSyncPath(listingName(line), matchers))
+}
+
+// `stat -c '%Y %s %n'` prints "<mtime> <size> <name>" for every file below dir.
+// Both GNU and busybox stat support this format; busybox find lacks -printf.
+function syncDirectoryStatCommand(dir: string): string {
+  return `cd ${shlex.quote(dir)} && find . -type f -not -path '*/_runner_hook_responses*' -exec stat -c '%Y %s %n' {} \\;`
+}
+
+function signatureFromStatLines(
+  lines: string[],
+  matchers: RegExp[]
+): SyncDirectorySignature {
+  const signature: SyncDirectorySignature = {
+    files: 0,
+    bytes: 0,
+    latestMtimeSeconds: 0
+  }
+  for (const line of lines) {
+    const first = line.indexOf(' ')
+    const second = first === -1 ? -1 : line.indexOf(' ', first + 1)
+    if (first === -1 || second === -1) {
+      continue
+    }
+    if (isExcludedSyncPath(line.slice(second + 1), matchers)) {
+      continue
+    }
+    const mtime = parseInt(line.slice(0, first), 10)
+    const size = parseInt(line.slice(first + 1, second), 10)
+    if (isNaN(mtime) || isNaN(size)) {
+      continue
+    }
+    signature.files++
+    signature.bytes += size
+    if (mtime > signature.latestMtimeSeconds) {
+      signature.latestMtimeSeconds = mtime
+    }
+  }
+  return signature
+}
+
+function walkLocalDirectory(dir: string): LocalSyncEntry[] {
+  const entries: LocalSyncEntry[] = []
+  const visit = (relative: string): void => {
+    let children: fs.Dirent[]
+    try {
+      children = fs.readdirSync(relative ? path.join(dir, relative) : dir, {
+        withFileTypes: true
+      })
+    } catch (readError) {
+      core.debug(
+        `[cpFromPod] cannot read ${relative || dir}: ${String(readError)}`
+      )
+      return
+    }
+    for (const child of children) {
+      const childRel = relative ? `${relative}/${child.name}` : child.name
+      if (child.name.includes('_runner_hook_responses')) {
+        continue
+      }
+      if (child.isDirectory()) {
+        visit(childRel)
+      } else if (child.isFile()) {
+        try {
+          const stat = fs.statSync(path.join(dir, childRel))
+          entries.push({
+            rel: `./${childRel}`,
+            size: stat.size,
+            mtimeSeconds: Math.floor(stat.mtimeMs / 1000)
+          })
+        } catch (statError) {
+          core.debug(
+            `[cpFromPod] cannot stat ${childRel}: ${String(statError)}`
+          )
+        }
+      }
+    }
+  }
+  visit('')
+  return entries
+}
+
+function localSyncSignature(
+  dir: string,
+  matchers: RegExp[]
+): SyncDirectorySignature {
+  const signature: SyncDirectorySignature = {
+    files: 0,
+    bytes: 0,
+    latestMtimeSeconds: 0
+  }
+  for (const entry of walkLocalDirectory(dir)) {
+    if (isExcludedSyncPath(entry.rel, matchers)) {
+      continue
+    }
+    signature.files++
+    signature.bytes += entry.size
+    if (entry.mtimeSeconds > signature.latestMtimeSeconds) {
+      signature.latestMtimeSeconds = entry.mtimeSeconds
+    }
+  }
+  return signature
+}
+
+function localSyncListing(dir: string): string[] {
+  return walkLocalDirectory(dir).map(entry => `${entry.size} ${entry.rel}`)
+}
+
+function signaturesEqual(
+  left: SyncDirectorySignature,
+  right: SyncDirectorySignature
+): boolean {
+  return (
+    left.files === right.files &&
+    left.bytes === right.bytes &&
+    left.latestMtimeSeconds === right.latestMtimeSeconds
+  )
+}
+
+// Removes a directory even when tar-fs still holds short-lived file handles
+// open (Windows needs the retries; on Linux the first attempt succeeds).
+function removeSyncDirectory(dir: string): void {
+  fs.rmSync(dir, {
+    recursive: true,
+    force: true,
+    maxRetries: 10,
+    retryDelay: 100
+  })
+}
+
+function errorText(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message
+  }
+  return String(error)
+}
+
+function isTruncatedStreamError(error: unknown): boolean {
+  return CP_FROM_POD_TRUNCATION_PATTERN.test(errorText(error))
+}
+
+function formatTransferRate(bytes: number, elapsedMs: number): string {
+  if (elapsedMs <= 0) {
+    return 'n/a'
+  }
+  return (bytes / (1024 * 1024) / (elapsedMs / 1000)).toFixed(3)
+}
+
+// Compares the pod-side directory with the runner-side snapshot. Uses file
+// count, total size and the newest mtime so an unchanged directory skips the
+// whole transfer. Errors fall back to transferring (the safe default).
+async function isPodSyncUnchanged(
+  podName: string,
+  containerPath: string,
+  targetRunnerPath: string,
+  settings: CpFromPodSettings
+): Promise<boolean> {
+  if (!fs.existsSync(targetRunnerPath)) {
+    return false
+  }
+  try {
+    const { lines } = await execCalculateOutputHashSorted(
+      podName,
+      JOB_CONTAINER_NAME,
+      ['sh', '-c', syncDirectoryStatCommand(containerPath)]
+    )
+    const podSignature = signatureFromStatLines(lines, settings.excludeMatchers)
+    const runnerSignature = localSyncSignature(
+      targetRunnerPath,
+      settings.excludeMatchers
+    )
+    core.debug(
+      `[cpFromPod] signature pod=${JSON.stringify(podSignature)} runner=${JSON.stringify(runnerSignature)}`
+    )
+    return signaturesEqual(podSignature, runnerSignature)
+  } catch (error) {
+    core.debug(
+      `[cpFromPod] signature comparison failed, transferring: ${errorText(error)}`
+    )
+    return false
+  }
+}
+
+// Builds the tar extraction sink shared by both transfer modes.
+//
+// tar-fs opens a write stream per file entry asynchronously. When the archive
+// turns out to be truncated, entries may still start writing after the attempt
+// was aborted; on Windows such a handle keeps the staging directory
+// undeletable. Tracking the streams lets us close them, and a discarded sink
+// prevents late entries from touching the filesystem at all.
+function createStagingSink(
+  stagingRoot: string,
+  progress: TransferProgress
+): { writerStream: ReturnType<typeof tar.extract>; abort: () => void } {
+  let aborted = false
+  const openWriteStreams = new Set<stream.Writable>()
+  // `fs` is a module namespace object with getter-only properties, so a
+  // prototype based overlay cannot be written to; copy the helpers instead.
+  const trackingFs = Object.assign({}, fs)
+  trackingFs.createWriteStream = ((
+    filePath: fs.PathLike,
+    options?: unknown
+  ): fs.WriteStream => {
+    if (aborted) {
+      return new stream.Writable({
+        write: (_chunk, _encoding, callback) => callback()
+      }) as unknown as fs.WriteStream
+    }
+    const createWriteStream = fs.createWriteStream as unknown as (
+      path: fs.PathLike,
+      streamOptions?: unknown
+    ) => fs.WriteStream
+    const writeStream = createWriteStream(filePath, options)
+    openWriteStreams.add(writeStream)
+    writeStream.on('close', () => openWriteStreams.delete(writeStream))
+    return writeStream
+  }) as typeof fs.createWriteStream
+
+  const writerStream = tar.extract(stagingRoot, { fs: trackingFs })
+
+  // Count received bytes without inserting another stream into the pipe.
+  const originalWrite = writerStream.write.bind(writerStream) as (
+    chunk: Buffer | string,
+    encoding?: string,
+    callback?: (error?: Error | null) => void
+  ) => boolean
+  writerStream.write = ((
+    chunk: Buffer | string,
+    encodingOrCallback?: string | ((error?: Error | null) => void),
+    callback?: (error?: Error | null) => void
+  ): boolean => {
+    progress.bytes +=
+      typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length
+    if (typeof encodingOrCallback === 'function') {
+      return originalWrite(chunk, undefined, encodingOrCallback)
+    }
+    return originalWrite(chunk, encodingOrCallback, callback)
+  }) as typeof writerStream.write
+
+  const abort = (): void => {
+    aborted = true
+    try {
+      if (!writerStream.destroyed) {
+        writerStream.destroy()
+      }
+    } catch (destroyError) {
+      core.debug(
+        `[cpFromPod] destroying the extract stream failed: ${errorText(destroyError)}`
+      )
+    }
+    openWriteStreams.forEach(writeStream => {
+      try {
+        writeStream.destroy()
+      } catch (destroyError) {
+        core.debug(
+          `[cpFromPod] destroying a staged write stream failed: ${errorText(destroyError)}`
+        )
+      }
+    })
+    openWriteStreams.clear()
+  }
+
+  return { writerStream, abort }
+}
+
+// ---------------------------------------------------------------------------
+// Direct pod-to-pod transfer (opt-in: HOOKS_SYNC_MODE=direct)
+//
+// The exec based transfer above tunnels the tar stream through the API
+// server: runner pod -> apiserver -> kubelet -> job container. When the
+// apiserver runs in another site than the job pods (cloud managed control
+// plane, lab workers), every byte crosses that slow link twice and large
+// /__w/_temp trees get truncated. In direct mode the job container pushes the
+// very same tar stream straight to the runner pod over the pod network; the
+// exec channel is only used to start the sender and carries no payload.
+//
+// Any direct failure falls back to the exec channel, and after
+// DIRECT_SYNC_MAX_CONSECUTIVE_FAILURES failures the mode is disabled for the
+// rest of the process, so a missing bash in the job container can never make
+// the sync harder than it is today.
+// ---------------------------------------------------------------------------
+
+const DIRECT_SYNC_MAX_CONSECUTIVE_FAILURES = 2
+// Upper bound on the token line; the token itself is 32 hex characters, so
+// anything larger is either a bug or an attacker probing the port.
+const HANDSHAKE_MAX_BYTES = 128
+// Per-direction budgets: a failing direction must not spend the other
+// direction's direct attempts. Both counters live for the whole hook process.
+let directSyncFromPodConsecutiveFailures = 0
+let directSyncToPodConsecutiveFailures = 0
+
+function syncModeIsDirect(): boolean {
+  return (
+    (process.env['HOOKS_SYNC_MODE'] || '').trim().toLowerCase() === 'direct'
+  )
+}
+
+function directSyncMaxFailures(): number {
+  return envPositiveInt(
+    'HOOKS_SYNC_DIRECT_MAX_FAILURES',
+    DIRECT_SYNC_MAX_CONSECUTIVE_FAILURES
+  )
+}
+
+// Constant-time comparison for the one-time handshake token, shared by both
+// transfer directions. Length is checked first so timingSafeEqual never sees
+// buffers of different sizes.
+function tokenMatchesHex(expected: string, received: string): boolean {
+  const expectedBuf = Buffer.from(expected, 'utf8')
+  const actualBuf = Buffer.from(received, 'utf8')
+  return (
+    actualBuf.length === expectedBuf.length &&
+    timingSafeEqual(expectedBuf, actualBuf)
+  )
+}
+
+// The listener binds to the pod IP, which any in-cluster client can reach.
+// Dropping an unauthenticated peer (instead of failing the whole attempt)
+// keeps a monitoring probe or security scanner from permanently disabling
+// direct mode with two accidental hits. The attempt-level timeout still
+// bounds how long a bad peer can hold the listener open.
+function dropUnauthenticatedSocket(
+  direction: 'cpFromPod' | 'cpToPod',
+  socket: net.Socket,
+  sockets: Set<net.Socket>,
+  reason: string
+): void {
+  core.debug(`[${direction}] dropping unauthenticated connection: ${reason}`)
+  sockets.delete(socket)
+  try {
+    socket.destroy()
+  } catch (destroyError) {
+    core.debug(
+      `[${direction}] destroying an unauthenticated socket failed: ${errorText(destroyError)}`
+    )
+  }
+}
+
+const CP_TO_POD_DIRECT_TIMEOUT_MS = 15 * 60 * 1000
+
+function shQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+// The address the job container connects back to: the runner pod IP unless an
+// explicit override is configured.
+async function getSyncListenAddress(): Promise<string> {
+  const override = (process.env['HOOKS_SYNC_LISTEN_IP'] || '').trim()
+  if (override) {
+    return override
+  }
+  const pod = await readPod(getRunnerPodName())
+  const podIP = pod.status?.podIP
+  if (!podIP) {
+    throw new Error('the runner pod has no podIP yet')
+  }
+  return podIP
+}
+
+// bash /dev/tcp needs brackets around IPv6 literals; Node's net.listen takes
+// the raw address, so only the script side gets the brackets.
+function devTcpAddress(address: string): string {
+  return address.includes(':') ? `[${address}]` : address
+}
+
+// Runs one direct transfer attempt: the runner pod listens on an ephemeral
+// port bound to its own pod IP, and the job container opens one connection to
+// it, sends a one-time token, then streams
+//   tar cf - <excludes> -C <parent> <dirname>
+// over that connection, so the payload never goes through the API server.
+async function transferTarFromPodDirectOnce(
+  podName: string,
+  containerPath: string,
+  stagingRoot: string,
+  settings: CpFromPodSettings,
+  timeoutMs: number,
+  progress: TransferProgress
+): Promise<void> {
+  const listenAddress = await getSyncListenAddress()
+
+  const containerPaths = containerPath.split('/')
+  const dirname = containerPaths.pop() as string
+  const parentDir = containerPaths.join('/') || '/'
+
+  const sink = createStagingSink(stagingRoot, progress)
+  const writerStream = sink.writerStream
+  const errStream = new WritableStreamBuffer()
+
+  const transferToken = randomBytes(16).toString('hex')
+
+  const server = net.createServer()
+  const sockets = new Set<net.Socket>()
+  // Only one peer may feed the shared extract stream. Unauthenticated probes
+  // can arrive in parallel and are dropped individually without failing the
+  // attempt, so the real job connection is never displaced by a scanner.
+  let authenticatedSocket: net.Socket | undefined
+  let execSocket: { close: () => void } | undefined
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+
+      const settle = (failure?: unknown): void => {
+        if (settled) {
+          return
+        }
+        settled = true
+        if (timer) {
+          clearTimeout(timer)
+        }
+        sink.abort()
+        sockets.forEach(socket => {
+          try {
+            socket.destroy()
+          } catch (destroyError) {
+            core.debug(
+              `[cpFromPod] destroying a direct-transfer socket failed: ${errorText(destroyError)}`
+            )
+          }
+        })
+        sockets.clear()
+        try {
+          server.close()
+        } catch (closeError) {
+          core.debug(
+            `[cpFromPod] closing the direct-transfer listener failed: ${errorText(closeError)}`
+          )
+        }
+        try {
+          execSocket?.close()
+        } catch (closeError) {
+          core.debug(
+            `[cpFromPod] closing the exec socket failed: ${errorText(closeError)}`
+          )
+        }
+        if (failure === undefined) {
+          resolve()
+        } else {
+          reject(
+            failure instanceof Error ? failure : new Error(errorText(failure))
+          )
+        }
+      }
+
+      writerStream.on('error', (streamError: Error) => settle(streamError))
+      writerStream.on('finish', () => settle())
+      writerStream.on(
+        'entry',
+        (_header: unknown, entryStream: stream.Readable) => {
+          entryStream.on('error', (entryError: Error) => settle(entryError))
+        }
+      )
+
+      timer = setTimeout(() => {
+        settle(
+          new Error(
+            `direct transfer timed out after ${timeoutMs}ms (${progress.bytes} bytes received)`
+          )
+        )
+      }, timeoutMs)
+
+      server.on('connection', (socket: net.Socket) => {
+        if (authenticatedSocket) {
+          dropUnauthenticatedSocket(
+            'cpFromPod',
+            socket,
+            sockets,
+            'an authenticated connection already exists'
+          )
+          return
+        }
+        sockets.add(socket)
+
+        // The port is reachable by every pod in the cluster, so the first
+        // bytes on the wire must be the one-time token handed to the job
+        // container through the exec command. A peer that fails to prove it
+        // is dropped; it must never fail the transfer or evict the real job
+        // connection from the listener.
+        let pending = Buffer.alloc(0)
+        let authenticated = false
+        let archiveEnded = false
+
+        socket.on('error', (socketError: Error) => {
+          if (authenticated) {
+            settle(socketError)
+          } else {
+            dropUnauthenticatedSocket(
+              'cpFromPod',
+              socket,
+              sockets,
+              `socket error: ${errorText(socketError)}`
+            )
+          }
+        })
+        socket.on('close', () => {
+          sockets.delete(socket)
+          // A connection that dies without 'error'/'end' (some half-close
+          // sequences) would otherwise leave the extract stream open and the
+          // attempt hanging until the full attempt timeout.
+          if (authenticated && !archiveEnded && !settled) {
+            settle(
+              new Error(
+                'authenticated connection closed before the archive completed'
+              )
+            )
+          }
+        })
+        socket.on('data', (chunk: Buffer) => {
+          if (authenticated) {
+            if (!writerStream.write(chunk)) {
+              socket.pause()
+            }
+            return
+          }
+          pending = Buffer.concat([pending, chunk])
+          const newline = pending.indexOf(0x0a)
+          if (newline === -1) {
+            if (pending.length > HANDSHAKE_MAX_BYTES) {
+              dropUnauthenticatedSocket(
+                'cpFromPod',
+                socket,
+                sockets,
+                'handshake exceeded its size limit'
+              )
+            }
+            return
+          }
+          const received = pending.subarray(0, newline).toString('utf8')
+          const remainder = pending.subarray(newline + 1)
+          if (!tokenMatchesHex(transferToken, received)) {
+            dropUnauthenticatedSocket(
+              'cpFromPod',
+              socket,
+              sockets,
+              'invalid token'
+            )
+            return
+          }
+          authenticated = true
+          authenticatedSocket = socket
+          pending = Buffer.alloc(0)
+          writerStream.on('drain', () => socket.resume())
+          if (remainder.length && !writerStream.write(remainder)) {
+            socket.pause()
+          }
+        })
+        socket.on('end', () => {
+          if (!authenticated) {
+            dropUnauthenticatedSocket(
+              'cpFromPod',
+              socket,
+              sockets,
+              'connection closed before authenticating'
+            )
+            return
+          }
+          archiveEnded = true
+          // tar-stream settles the attempt on 'finish' once the archive is
+          // flushed to disk; ending the extract stream is what starts that.
+          writerStream.end()
+        })
+      })
+      server.on('error', (serverError: Error) => settle(serverError))
+
+      server.listen(0, listenAddress, () => {
+        const port = (server.address() as net.AddressInfo).port
+        const excludeArgs = settings.excludePatterns
+          .map(pattern => `--exclude=${shQuote(pattern)}`)
+          .join(' ')
+        // `exec 3<>` keeps a single descriptor for the token and the archive,
+        // so the handshake and the payload share one connection.
+        const script =
+          `exec 3<>/dev/tcp/${devTcpAddress(listenAddress)}/${port} || exit 1\n` +
+          `printf '%s\\n' ${shQuote(transferToken)} >&3\n` +
+          `exec tar cf - ${excludeArgs ? `${excludeArgs} ` : ''}` +
+          `-C ${shQuote(parentDir)} ${shQuote(dirname)} >&3`
+
+        new k8s.Exec(kc)
+          .exec(
+            namespace(),
+            podName,
+            JOB_CONTAINER_NAME,
+            ['bash', '-c', script],
+            null,
+            errStream,
+            null,
+            false,
+            (status: k8s.V1Status) => {
+              const details = errStream.size()
+                ? `: ${String(errStream.getContentsAsString()).trim()}`
+                : ''
+              if (status.status !== 'Success') {
+                settle(
+                  new Error(
+                    `pod-side tar exited with status '${status.status}'${details}`
+                  )
+                )
+                return
+              }
+              if (errStream.size()) {
+                settle(new Error(`pod-side tar reported an error${details}`))
+              }
+              // Do not resolve here: the extraction stream still has to be
+              // flushed to disk; 'finish' settles the attempt.
+            }
+          )
+          .then(webSocket => {
+            execSocket = webSocket
+            if (settled) {
+              try {
+                webSocket.close()
+              } catch (closeError) {
+                core.debug(
+                  `[cpFromPod] closing a late exec socket failed: ${errorText(closeError)}`
+                )
+              }
+            }
+          })
+          .catch((execError: unknown) => settle(execError))
+      })
+    })
+  } finally {
+    sink.abort()
+    try {
+      server.close()
+    } catch (closeError) {
+      core.debug(
+        `[cpFromPod] closing the direct-transfer listener failed: ${errorText(closeError)}`
+      )
+    }
+  }
+}
+
+// Reverse direction of transferTarFromPodDirectOnce: push a runner-side
+// directory into the job container without sending the tar payload through
+// the API server. The runner listens on its pod IP, exec only starts a small
+// bash command in the job container, and that container connects back over
+// the pod network, authenticates with a one-time token, then extracts the
+// streamed archive. The exec channel carries no payload bytes.
+async function transferTarToPodDirectOnce(
+  podName: string,
+  runnerPath: string,
+  containerPath: string,
+  timeoutMs: number
+): Promise<void> {
+  const listenAddress = await getSyncListenAddress()
+  const transferToken = randomBytes(16).toString('hex')
+
+  const server = net.createServer()
+  const sockets = new Set<net.Socket>()
+  // As above: only the authenticated job connection may receive the tar
+  // stream; probes are dropped without consuming the transfer attempt.
+  let authenticatedSocket: net.Socket | undefined
+  let execSocket: { close: () => void } | undefined
+  let packStream: stream.Readable | undefined
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+    let execSucceeded = false
+    let streamFinished = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const settle = (failure?: unknown): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (timer) {
+        clearTimeout(timer)
+      }
+      try {
+        packStream?.destroy()
+      } catch (destroyError) {
+        core.debug(
+          `[cpToPod] destroying the pack stream failed: ${errorText(destroyError)}`
+        )
+      }
+      sockets.forEach(socket => {
+        try {
+          socket.destroy()
+        } catch (destroyError) {
+          core.debug(
+            `[cpToPod] destroying a direct-transfer socket failed: ${errorText(destroyError)}`
+          )
+        }
+      })
+      sockets.clear()
+      try {
+        server.close()
+      } catch (closeError) {
+        core.debug(
+          `[cpToPod] closing the direct-transfer listener failed: ${errorText(closeError)}`
+        )
+      }
+      try {
+        execSocket?.close()
+      } catch (closeError) {
+        core.debug(
+          `[cpToPod] closing the exec socket failed: ${errorText(closeError)}`
+        )
+      }
+      if (failure === undefined) {
+        resolve()
+      } else {
+        reject(
+          failure instanceof Error ? failure : new Error(errorText(failure))
+        )
+      }
+    }
+
+    // Both the pod-side extraction and the runner-side archive must finish.
+    const maybeSucceed = (): void => {
+      if (execSucceeded && streamFinished) {
+        settle()
+      }
+    }
+
+    timer = setTimeout(() => {
+      settle(new Error(`direct push timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+
+    server.on('error', serverError => settle(serverError))
+
+    server.on('connection', (socket: net.Socket) => {
+      if (authenticatedSocket) {
+        dropUnauthenticatedSocket(
+          'cpToPod',
+          socket,
+          sockets,
+          'an authenticated connection already exists'
+        )
+        return
+      }
+      sockets.add(socket)
+
+      let pending = Buffer.alloc(0)
+      let authenticated = false
+
+      socket.on('error', socketError => {
+        if (authenticated) {
+          settle(socketError)
+        } else {
+          dropUnauthenticatedSocket(
+            'cpToPod',
+            socket,
+            sockets,
+            `socket error: ${errorText(socketError)}`
+          )
+        }
+      })
+      socket.on('close', () => {
+        sockets.delete(socket)
+        // A connection that goes away without an error event would otherwise
+        // leave the pack stream pushing into a dead socket while the attempt
+        // waits on the exec status until the full attempt timeout. Once the
+        // archive finished sending, the peer closing is part of the normal
+        // flow and must not fail the attempt.
+        if (authenticated && !streamFinished && !settled) {
+          settle(
+            new Error(
+              'authenticated connection closed before the archive finished sending'
+            )
+          )
+        }
+      })
+      socket.on('data', (chunk: Buffer) => {
+        if (authenticated) {
+          return
+        }
+        pending = Buffer.concat([pending, chunk])
+        const newline = pending.indexOf(0x0a)
+        if (newline === -1) {
+          if (pending.length > HANDSHAKE_MAX_BYTES) {
+            dropUnauthenticatedSocket(
+              'cpToPod',
+              socket,
+              sockets,
+              'handshake exceeded its size limit'
+            )
+          }
+          return
+        }
+        const received = pending.subarray(0, newline).toString('utf8')
+        if (!tokenMatchesHex(transferToken, received)) {
+          dropUnauthenticatedSocket('cpToPod', socket, sockets, 'invalid token')
+          return
+        }
+        authenticated = true
+        authenticatedSocket = socket
+        pending = Buffer.alloc(0)
+
+        // Authenticated: stream the runner-side directory to the pod.
+        const pack = tar.pack(runnerPath)
+        packStream = pack
+        pack.on('error', packError => settle(packError))
+        pack.on('data', (data: Buffer) => {
+          if (!socket.write(data)) {
+            pack.pause()
+          }
+        })
+        socket.on('drain', () => pack.resume())
+        pack.on('end', () => {
+          streamFinished = true
+          // Half-close so the pod-side `tar xf -` observes EOF.
+          socket.end()
+          maybeSucceed()
+        })
+      })
+    })
+
+    server.listen(0, listenAddress, () => {
+      const port = (server.address() as net.AddressInfo).port
+      const script =
+        `exec 3<>/dev/tcp/${devTcpAddress(listenAddress)}/${port} || exit 1\n` +
+        `printf '%s\\n' ${shQuote(transferToken)} >&3\n` +
+        // A failed extraction must not be masked: exiting non-zero surfaces
+        // the failure through the exec status, so the caller falls back to
+        // the exec channel instead of trusting a torn copy. The extraction
+        // part is shared with the exec fallback path (podExtractScript) so
+        // the fatal-vs-tolerated stderr classification and the read-only
+        // rootfs fallback cannot drift apart.
+        podExtractScript(containerPath, '<&3')
+
+      const errStream = new WritableStreamBuffer()
+      new k8s.Exec(kc)
+        .exec(
+          namespace(),
+          podName,
+          JOB_CONTAINER_NAME,
+          ['bash', '-c', script],
+          null,
+          errStream,
+          null,
+          false,
+          (status: k8s.V1Status) => {
+            const details = errStream.size()
+              ? `: ${String(errStream.getContentsAsString()).trim()}`
+              : ''
+            if (status.status !== 'Success' || errStream.size()) {
+              settle(
+                new Error(
+                  `pod-side extraction exited with '${status.status}'${details}`
+                )
+              )
+              return
+            }
+            execSucceeded = true
+            maybeSucceed()
+          }
+        )
+        .then(webSocket => {
+          execSocket = webSocket
+          if (settled) {
+            try {
+              webSocket.close()
+            } catch (closeError) {
+              core.debug(
+                `[cpToPod] closing a late exec socket failed: ${errorText(closeError)}`
+              )
+            }
+          }
+        })
+        .catch(execError => settle(execError))
+    })
+  })
+}
+
+// Runs one transfer attempt. Resolves only after tar-fs finished flushing the
+// archive to disk; rejects on any stream error, stderr output, non-Success
+// exec status, timeout or transport failure.
+async function transferTarFromPodOnce(
+  podName: string,
+  containerPath: string,
+  stagingRoot: string,
+  settings: CpFromPodSettings,
+  timeoutMs: number,
+  progress: TransferProgress
+): Promise<void> {
+  const containerPaths = containerPath.split('/')
+  const dirname = containerPaths.pop() as string
+  const command = ['tar', 'cf', '-']
+  for (const pattern of settings.excludePatterns) {
+    command.push(`--exclude=${pattern}`)
+  }
+  command.push('-C', containerPaths.join('/') || '/', dirname)
+
+  const exec = new k8s.Exec(kc)
+
+  const sink = createStagingSink(stagingRoot, progress)
+  const writerStream = sink.writerStream
+  const errStream = new WritableStreamBuffer()
+
+  let socket: { close: () => void } | undefined
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const settle = (failure?: unknown): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (timer) {
+        clearTimeout(timer)
+      }
+      sink.abort()
+      try {
+        socket?.close()
+      } catch (closeError) {
+        core.debug(
+          `[cpFromPod] closing the exec socket failed: ${errorText(closeError)}`
+        )
+      }
+      if (failure === undefined) {
+        resolve()
+      } else {
+        reject(
+          failure instanceof Error ? failure : new Error(errorText(failure))
+        )
+      }
+    }
+
+    // tar-stream reports a truncated archive as an asynchronous 'error'
+    // ("Unexpected end of data"). The listener stays attached for the whole
+    // attempt: a late error after settle() must never become an uncaught
+    // exception.
+    writerStream.on('error', (streamError: Error) => settle(streamError))
+    writerStream.on('finish', () => settle())
+    // A truncated archive can also surface on the individual entry streams
+    // (tar-stream destroys the open entry with the same error). Directory
+    // entries are not consumed by anyone, so without a listener that error
+    // becomes an uncaught exception as well.
+    writerStream.on(
+      'entry',
+      (_header: unknown, entryStream: stream.Readable) => {
+        entryStream.on('error', (entryError: Error) => settle(entryError))
+      }
+    )
+
+    timer = setTimeout(() => {
+      settle(
+        new Error(
+          `transfer timed out after ${timeoutMs}ms (${progress.bytes} bytes received)`
+        )
+      )
+    }, timeoutMs)
+
+    exec
+      .exec(
+        namespace(),
+        podName,
+        JOB_CONTAINER_NAME,
+        command,
+        writerStream,
+        errStream,
+        null,
+        false,
+        (status: k8s.V1Status) => {
+          const details = errStream.size()
+            ? `: ${String(errStream.getContentsAsString()).trim()}`
+            : ''
+          if (status.status !== 'Success') {
+            settle(
+              new Error(
+                `pod-side tar exited with status '${status.status}'${details}`
+              )
+            )
+            return
+          }
+          if (errStream.size()) {
+            settle(new Error(`pod-side tar reported an error${details}`))
+          }
+          // Do not resolve here: tar-fs may still be flushing buffered data
+          // to disk. 'finish'/'error' on writerStream settle the attempt.
+        }
+      )
+      .then(webSocket => {
+        socket = webSocket
+        if (settled) {
+          try {
+            webSocket.close()
+          } catch (closeError) {
+            core.debug(
+              `[cpFromPod] closing a late exec socket failed: ${errorText(closeError)}`
+            )
+          }
+        }
+      })
+      .catch((execError: unknown) => settle(execError))
+  })
 }
 
 export async function execCpFromPod(
@@ -729,111 +1994,181 @@ export async function execCpFromPod(
   const stagingPath = `${stagingRoot}/${basename}`
   const trashPath = `${parentRunnerPath}/.${basename}.trash`
 
-  let attempt = 0
-  while (true) {
-    try {
-      // Start from a clean staging area so a retry never mixes with partial
-      // content left behind by a previous failed attempt.
-      fs.rmSync(stagingRoot, { recursive: true, force: true })
-      fs.mkdirSync(stagingRoot, { recursive: true })
+  const settings = cpFromPodSettings()
+  const startedAt = Date.now()
 
-      // make temporary directory
-      const exec = new k8s.Exec(kc)
-      const containerPaths = containerPath.split('/')
-      const dirname = containerPaths.pop() as string
-      const command = [
-        'tar',
-        'cf',
-        '-',
-        '-C',
-        containerPaths.join('/') || '/',
-        dirname
-      ]
-      const writerStream = tar.extract(stagingRoot)
-      const errStream = new WritableStreamBuffer()
+  // Leftovers from an interrupted run are never a complete snapshot and must
+  // not be published, so drop them before doing anything else.
+  removeSyncDirectory(stagingRoot)
+  removeSyncDirectory(trashPath)
 
-      await new Promise((resolve, reject) => {
-        // Resolve only after writerStream finishes flushing to disk.
-        // The k8s status callback fires when the pod-side tar process exits,
-        // but tar-fs may still be writing buffered data to the local filesystem.
-        // Waiting for 'finish' ensures all files are on disk before hash check.
-        writerStream.on('finish', resolve)
-        writerStream.on('error', reject)
-        exec
-          .exec(
-            namespace(),
-            podName,
-            JOB_CONTAINER_NAME,
-            command,
-            writerStream,
-            errStream,
-            null,
-            false,
-            async () => {
-              if (errStream.size()) {
-                reject(
-                  new Error(
-                    `Error from cpFromPod - details: \n ${errStream.getContentsAsString()}`
-                  )
-                )
-              }
-            }
-          )
-          .catch(e => reject(e))
-      })
+  if (
+    await isPodSyncUnchanged(podName, containerPath, targetRunnerPath, settings)
+  ) {
+    core.debug(
+      `[cpFromPod] ${containerPath} is unchanged since the last sync; skipping transfer (${Date.now() - startedAt}ms)`
+    )
+    return
+  }
+
+  let backoffMs = settings.backoffBaseMs
+  let lastError: unknown
+  let attemptsMade = 0
+  let lastBytes = 0
+  let totalBytes = 0
+  let extracted = false
+
+  for (let attempt = 1; attempt <= settings.maxAttempts; attempt++) {
+    const remainingMs = settings.deadlineMs - (Date.now() - startedAt)
+    if (remainingMs <= 0) {
+      core.debug(
+        `[cpFromPod] overall deadline of ${settings.deadlineMs}ms exceeded before attempt ${attempt}`
+      )
       break
-    } catch (error) {
-      core.debug(`Attempt ${attempt + 1} failed: ${error}`)
-      attempt++
-      if (attempt >= 30) {
-        fs.rmSync(stagingRoot, { recursive: true, force: true })
-        throw new Error(
-          `execCpFromPod failed after ${attempt} attempts: ${JSON.stringify(error)}`
+    }
+
+    attemptsMade = attempt
+    const progress: TransferProgress = { bytes: 0 }
+    // Start from a clean staging area so a retry never mixes with partial
+    // content left behind by a previous failed attempt.
+    removeSyncDirectory(stagingRoot)
+    fs.mkdirSync(stagingRoot, { recursive: true })
+    const attemptStartedAt = Date.now()
+
+    try {
+      let directSucceeded = false
+      if (
+        syncModeIsDirect() &&
+        directSyncFromPodConsecutiveFailures < directSyncMaxFailures()
+      ) {
+        try {
+          await transferTarFromPodDirectOnce(
+            podName,
+            containerPath,
+            stagingRoot,
+            settings,
+            Math.min(settings.attemptTimeoutMs, remainingMs),
+            progress
+          )
+          directSucceeded = true
+        } catch (directError) {
+          directSyncFromPodConsecutiveFailures++
+          // The partial staging content from the failed direct attempt must
+          // not be mixed with the fallback transfer.
+          removeSyncDirectory(stagingRoot)
+          fs.mkdirSync(stagingRoot, { recursive: true })
+          core.warning(
+            `[cpFromPod] direct pod-to-pod transfer failed (${errorText(directError)}); falling back to the exec channel`
+          )
+          await transferTarFromPodOnce(
+            podName,
+            containerPath,
+            stagingRoot,
+            settings,
+            Math.min(settings.attemptTimeoutMs, remainingMs),
+            progress
+          )
+        }
+      } else {
+        await transferTarFromPodOnce(
+          podName,
+          containerPath,
+          stagingRoot,
+          settings,
+          Math.min(settings.attemptTimeoutMs, remainingMs),
+          progress
         )
       }
-      await sleep(1000)
+      // Only a successful *direct* transfer clears the failure streak. A
+      // fallback to exec means the direct channel is still unhealthy, so the
+      // counter must be retained; otherwise the disable-after-N guard never
+      // trips and every sync keeps paying for a failed direct attempt.
+      if (directSucceeded) {
+        directSyncFromPodConsecutiveFailures = 0
+      }
+      totalBytes += progress.bytes
+      const elapsed = Date.now() - attemptStartedAt
+      core.debug(
+        `[cpFromPod] attempt ${attempt}/${settings.maxAttempts} succeeded: ${progress.bytes} bytes in ${elapsed}ms (${formatTransferRate(progress.bytes, elapsed)} MiB/s)`
+      )
+      extracted = true
+      break
+    } catch (error) {
+      lastError = error
+      lastBytes = progress.bytes
+      totalBytes += progress.bytes
+      const elapsed = Date.now() - attemptStartedAt
+      removeSyncDirectory(stagingRoot)
+      const classification = isTruncatedStreamError(error)
+        ? 'truncated stream'
+        : 'transfer error'
+      core.debug(
+        `[cpFromPod] attempt ${attempt}/${settings.maxAttempts} failed (${classification}) after ${elapsed}ms: ${lastBytes} bytes received (${formatTransferRate(lastBytes, elapsed)} MiB/s): ${errorText(error)}`
+      )
+
+      if (attempt >= settings.maxAttempts) {
+        break
+      }
+      if (Date.now() - startedAt + backoffMs >= settings.deadlineMs) {
+        core.debug(
+          `[cpFromPod] overall deadline of ${settings.deadlineMs}ms would be exceeded by the next retry; giving up`
+        )
+        break
+      }
+      await sleep(backoffMs)
+      backoffMs = Math.min(backoffMs * 2, settings.backoffMaxMs)
     }
   }
 
-  let verified = false
-  let attempts = 15
-  const delay = 1000
-  for (let i = 0; i < attempts; i++) {
-    try {
-      const { hash: want, lines: wantLines } =
-        await execCalculateOutputHashSorted(podName, JOB_CONTAINER_NAME, [
-          'sh',
-          '-c',
-          listDirAllCommand(containerPath)
-        ])
+  if (!extracted) {
+    throw new Error(
+      `execCpFromPod: incomplete transfer of ${containerPath} from pod ${podName} after ${attemptsMade} attempt(s), ${lastBytes} bytes received in the last attempt (${lastError ? errorText(lastError) : 'overall deadline exceeded'}); the runner-side copy was left untouched`
+    )
+  }
 
-      const { hash: got, lines: gotLines } =
-        await localCalculateOutputHashSorted([
-          'sh',
-          '-c',
-          listDirAllCommand(stagingPath)
-        ])
+  let verified = false
+  const verificationAttempts = 15
+  const verificationDelay = 1000
+  for (let i = 0; i < verificationAttempts; i++) {
+    try {
+      const { lines: wantLines } = await execCalculateOutputHashSorted(
+        podName,
+        JOB_CONTAINER_NAME,
+        ['sh', '-c', listDirAllCommand(containerPath)]
+      )
+
+      const gotLines = localSyncListing(stagingPath)
+      const filteredWant = filterExcludedListing(
+        wantLines,
+        settings.excludeMatchers
+      )
+      const filteredGot = filterExcludedListing(
+        gotLines,
+        settings.excludeMatchers
+      )
+      const want = hashSortedListing(filteredWant)
+      const got = hashSortedListing(filteredGot)
 
       if (got !== want) {
         core.debug(
-          `[cpFromPod hash mismatch attempt ${i + 1}/${attempts}] want='${want}' got='${got}'`
+          `[cpFromPod hash mismatch attempt ${i + 1}/${verificationAttempts}] want='${want}' got='${got}'`
         )
         core.debug(
-          `[cpFromPod] pod file count=${wantLines.length} staging file count=${gotLines.length}`
+          `[cpFromPod] pod file count=${filteredWant.length} staging file count=${filteredGot.length}`
         )
         const wantMap = new Map(
-          wantLines.map(l => [l.replace(/^\d+ /, ''), l.split(' ')[0]])
+          filteredWant.map(l => [l.replace(/^\d+ /, ''), l.split(' ')[0]])
         )
         const gotMap = new Map(
-          gotLines.map(l => [l.replace(/^\d+ /, ''), l.split(' ')[0]])
+          filteredGot.map(l => [l.replace(/^\d+ /, ''), l.split(' ')[0]])
         )
-        const onlyInWant = wantLines.filter(
+        const onlyInWant = filteredWant.filter(
           l => !gotMap.has(l.replace(/^\d+ /, ''))
         )
-        const onlyInGot = gotLines.filter(
+        const onlyInGot = filteredGot.filter(
           l => !wantMap.has(l.replace(/^\d+ /, ''))
         )
-        const sizeDiff = wantLines
+        const sizeDiff = filteredWant
           .filter(l => {
             const name = l.replace(/^\d+ /, '')
             return gotMap.has(name) && gotMap.get(name) !== wantMap.get(name)
@@ -845,30 +2180,31 @@ export async function execCpFromPod(
         core.debug(`[cpFromPod] only in pod:    ${JSON.stringify(onlyInWant)}`)
         core.debug(`[cpFromPod] only in staging: ${JSON.stringify(onlyInGot)}`)
         core.debug(`[cpFromPod] size mismatch:  ${JSON.stringify(sizeDiff)}`)
-        await sleep(delay)
+        await sleep(verificationDelay)
         continue
       }
 
       verified = true
       break
     } catch (error) {
-      core.debug(`Attempt ${i + 1} failed: ${error}`)
-      await sleep(delay)
+      core.debug(`Verification attempt ${i + 1} failed: ${errorText(error)}`)
+      await sleep(verificationDelay)
     }
   }
 
   if (!verified) {
     // The pod content may have changed while it was being read (torn
-    // snapshot). Keep the eventual-consistency semantics of the previous
-    // implementation: publish the latest staged copy and leave a warning
-    // instead of silently keeping the old snapshot forever.
+    // snapshot). The staged directory was nevertheless extracted completely,
+    // so it is safe to publish it. Keep the eventual-consistency semantics of
+    // the previous implementation: publish the latest complete copy and leave
+    // a warning instead of silently keeping the old snapshot forever.
     core.warning(
-      `execCpFromPod: hash verification did not converge for ${containerPath}; publishing the latest staged copy`
+      `execCpFromPod: hash verification did not converge for ${containerPath}; publishing the latest completely extracted copy`
     )
   }
 
   if (!fs.existsSync(stagingPath)) {
-    fs.rmSync(stagingRoot, { recursive: true, force: true })
+    removeSyncDirectory(stagingRoot)
     throw new Error(
       `execCpFromPod: staged copy ${stagingPath} is missing; nothing to publish`
     )
@@ -878,10 +2214,12 @@ export async function execCpFromPod(
   // under parentRunnerPath, so every rename is a same-filesystem atomic
   // operation. Readers see either the complete old snapshot or the complete
   // new one; the only missing-file window is between the two renames below.
-  fs.rmSync(trashPath, { recursive: true, force: true })
+  removeSyncDirectory(trashPath)
+  let previousSnapshotInTrash = false
   if (fs.existsSync(targetRunnerPath)) {
     try {
       fs.renameSync(targetRunnerPath, trashPath)
+      previousSnapshotInTrash = true
     } catch (error) {
       core.debug(
         `rename of previous target to trash failed, falling back to rm: ${JSON.stringify(error)}`
@@ -889,9 +2227,35 @@ export async function execCpFromPod(
       fs.rmSync(targetRunnerPath, { recursive: true, force: true })
     }
   }
-  fs.renameSync(stagingPath, targetRunnerPath)
-  fs.rmSync(stagingRoot, { recursive: true, force: true })
-  fs.rmSync(trashPath, { recursive: true, force: true })
+  try {
+    fs.renameSync(stagingPath, targetRunnerPath)
+  } catch (renameError) {
+    // The old snapshot now sits in the trash directory while the target is
+    // missing. Restore it so the next sync cannot wipe the last good copy,
+    // then rethrow: the publish failed and the caller must know.
+    if (previousSnapshotInTrash && !fs.existsSync(targetRunnerPath)) {
+      try {
+        fs.renameSync(trashPath, targetRunnerPath)
+        core.warning(
+          `execCpFromPod: publishing ${stagingPath} failed; the previous snapshot was restored from ${trashPath} (${errorText(renameError)})`
+        )
+      } catch (restoreError) {
+        core.error(
+          `execCpFromPod: publishing failed and restoring the previous snapshot from ${trashPath} also failed; the old copy is preserved there (${errorText(restoreError)})`
+        )
+      }
+    }
+    throw renameError
+  }
+  removeSyncDirectory(stagingRoot)
+  removeSyncDirectory(trashPath)
+
+  const totalElapsed = Date.now() - startedAt
+  if (totalElapsed > settings.slowWarnMs) {
+    core.warning(
+      `execCpFromPod: syncing ${containerPath} took ${totalElapsed}ms over ${attemptsMade} attempt(s) (${totalBytes} bytes transferred, ${formatTransferRate(totalBytes, totalElapsed)} MiB/s); the exec channel looks slow`
+    )
+  }
 }
 
 export async function waitForJobToComplete(jobName: string): Promise<void> {
