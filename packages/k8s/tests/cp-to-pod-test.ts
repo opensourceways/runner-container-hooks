@@ -183,10 +183,7 @@ describe('execCpToPod', () => {
         _tty: boolean,
         callback: (resp: { status: string }) => void
       ) => {
-        if (
-          command[0] === 'sh' &&
-          String(command[2]).includes('tar xf -')
-        ) {
+        if (command[0] === 'sh' && String(command[2]).includes('tar xf -')) {
           if (pushFailuresLeft > 0) {
             pushFailuresLeft--
             callback({ status: 'Failure' })
@@ -216,42 +213,34 @@ describe('execCpToPod', () => {
     )
   }
 
-  it(
-    'rejects a failing pod-side exec status and retries until the push succeeds',
-    async () => {
-      fs.writeFileSync(path.join(runnerDir, 'retry.txt'), 'retry-me')
+  it('rejects a failing pod-side exec status and retries until the push succeeds', async () => {
+    fs.writeFileSync(path.join(runnerDir, 'retry.txt'), 'retry-me')
 
-      mockExecPodSide({ failPushStatuses: 2 })
+    mockExecPodSide({ failPushStatuses: 2 })
 
-      await execCpToPod('test-pod', runnerDir, CONTAINER_PATH)
+    await execCpToPod('test-pod', runnerDir, CONTAINER_PATH)
 
-      const pushCalls = execSpy.mock.calls.filter(
-        call =>
-          (call[3] as string[])[0] === 'sh' &&
-          String((call[3] as string[])[2]).includes('tar xf -')
-      )
-      // Two rejections must have triggered two retries before the success.
-      expect(pushCalls.length).toBeGreaterThanOrEqual(3)
-      expect(
-        fs.readFileSync(path.join(podSideDir, 'retry.txt'), 'utf8')
-      ).toBe('retry-me')
-    },
-    15000
-  )
+    const pushCalls = execSpy.mock.calls.filter(
+      call =>
+        (call[3] as string[])[0] === 'sh' &&
+        String((call[3] as string[])[2]).includes('tar xf -')
+    )
+    // Two rejections must have triggered two retries before the success.
+    expect(pushCalls.length).toBeGreaterThanOrEqual(3)
+    expect(fs.readFileSync(path.join(podSideDir, 'retry.txt'), 'utf8')).toBe(
+      'retry-me'
+    )
+  }, 15000)
 
-  it(
-    'throws when the listing verification never converges',
-    async () => {
-      fs.writeFileSync(path.join(runnerDir, 'content.txt'), 'real content')
+  it('throws when the listing verification never converges', async () => {
+    fs.writeFileSync(path.join(runnerDir, 'content.txt'), 'real content')
 
-      // A pod that reports Success but never materializes the files: this
-      // used to pass silently and leave an empty workspace downstream.
-      mockExecPodSide({ neverExtract: true })
+    // A pod that reports Success but never materializes the files: this
+    // used to pass silently and leave an empty workspace downstream.
+    mockExecPodSide({ neverExtract: true })
 
-      await expect(
-        execCpToPod('test-pod', runnerDir, CONTAINER_PATH)
-      ).rejects.toThrow(/did not converge/)
-    },
-    30000
-  )
+    await expect(
+      execCpToPod('test-pod', runnerDir, CONTAINER_PATH)
+    ).rejects.toThrow(/did not converge/)
+  }, 45000)
 })

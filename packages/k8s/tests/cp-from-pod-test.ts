@@ -368,56 +368,50 @@ describe('execCpFromPod', () => {
     expect(fs.existsSync(path.join(workDir, '._temp.trash'))).toBe(false)
   })
 
-  it(
-    'restores the previous snapshot when the publish rename fails',
-    async () => {
-      const podTemp = path.join(podSideDir, '_temp')
-      fs.mkdirSync(podTemp, { recursive: true })
-      fs.writeFileSync(path.join(podTemp, 'new.txt'), 'new')
+  it('restores the previous snapshot when the publish rename fails', async () => {
+    const podTemp = path.join(podSideDir, '_temp')
+    fs.mkdirSync(podTemp, { recursive: true })
+    fs.writeFileSync(path.join(podTemp, 'new.txt'), 'new')
 
-      // Previous runner-side snapshot: after the target was moved to the
-      // trash directory, a failed publish used to leave the last good copy
-      // stranded there, where the next sync would wipe it.
-      // NOTE: the hook builds the target with forward slashes
-      // (`${parentRunnerPath}/${basename}`), so compare against that exact
-      // string rather than path.join().
-      const target = `${workDir}/_temp`
-      fs.mkdirSync(target, { recursive: true })
-      fs.writeFileSync(path.join(target, 'old.txt'), 'old snapshot')
+    // Previous runner-side snapshot: after the target was moved to the
+    // trash directory, a failed publish used to leave the last good copy
+    // stranded there, where the next sync would wipe it.
+    // NOTE: the hook builds the target with forward slashes
+    // (`${parentRunnerPath}/${basename}`), so compare against that exact
+    // string rather than path.join().
+    const target = `${workDir}/_temp`
+    fs.mkdirSync(target, { recursive: true })
+    fs.writeFileSync(path.join(target, 'old.txt'), 'old snapshot')
 
-      mockPodSide()
+    mockPodSide()
 
-      // Fail exactly one rename: the staged -> target publish. The earlier
-      // target -> trash move and the later trash -> target restore share the
-      // destination with it, so only the first publish attempt fails.
-      const originalRenameSync = fs.renameSync
-      let publishFailuresLeft = 1
-      jest
-        .spyOn(fs, 'renameSync')
-        .mockImplementation(function (
-          this: unknown,
-          from: fs.PathLike,
-          to: fs.PathLike
-        ) {
-          if (String(to) === target && publishFailuresLeft > 0) {
-            publishFailuresLeft--
-            throw new Error('simulated publish rename failure')
-          }
-          return originalRenameSync.call(fs, from, to)
-        })
+    // Fail exactly one rename: the staged -> target publish. The earlier
+    // target -> trash move and the later trash -> target restore share the
+    // destination with it, so only the first publish attempt fails.
+    const originalRenameSync = fs.renameSync
+    let publishFailuresLeft = 1
+    jest.spyOn(fs, 'renameSync').mockImplementation(function (
+      this: unknown,
+      from: fs.PathLike,
+      to: fs.PathLike
+    ) {
+      if (String(to) === target && publishFailuresLeft > 0) {
+        publishFailuresLeft--
+        throw new Error('simulated publish rename failure')
+      }
+      return originalRenameSync.call(fs, from, to)
+    })
 
-      await expect(
-        execCpFromPod('test-pod', CONTAINER_TEMP, workDir)
-      ).rejects.toThrow(/simulated publish rename failure/)
+    await expect(
+      execCpFromPod('test-pod', CONTAINER_TEMP, workDir)
+    ).rejects.toThrow(/simulated publish rename failure/)
 
-      // The publish failed, so the old snapshot must be back in place.
-      expect(fs.readFileSync(path.join(target, 'old.txt'), 'utf8')).toBe(
-        'old snapshot'
-      )
-      expect(fs.existsSync(path.join(target, 'new.txt'))).toBe(false)
-      // The trash copy was renamed back, not left behind for the next sync.
-      expect(fs.existsSync(path.join(workDir, '._temp.trash'))).toBe(false)
-    },
-    15000
-  )
+    // The publish failed, so the old snapshot must be back in place.
+    expect(fs.readFileSync(path.join(target, 'old.txt'), 'utf8')).toBe(
+      'old snapshot'
+    )
+    expect(fs.existsSync(path.join(target, 'new.txt'))).toBe(false)
+    // The trash copy was renamed back, not left behind for the next sync.
+    expect(fs.existsSync(path.join(workDir, '._temp.trash'))).toBe(false)
+  }, 15000)
 })
