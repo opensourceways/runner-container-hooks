@@ -163,4 +163,95 @@ describe('execCpToPod', () => {
     )
     expect(shPushCalls).toHaveLength(0)
   })
+
+  // The pod-side push reports a non-Success exec status (a failed tar
+  // extraction, e.g. the data/IO errors the blocklist marks as fatal) for
+  // the given number of initial attempts, then really extracts.
+  function mockExecPodSide(
+    behavior: { failPushStatuses?: number; neverExtract?: boolean } = {}
+  ): void {
+    let pushFailuresLeft = behavior.failPushStatuses ?? 0
+    execSpy.mockImplementation(
+      async (
+        _ns: unknown,
+        _pod: unknown,
+        _container: unknown,
+        command: string[],
+        stdout: NodeJS.WritableStream,
+        _stderr: unknown,
+        stdin: NodeJS.ReadableStream | null,
+        _tty: boolean,
+        callback: (resp: { status: string }) => void
+      ) => {
+        if (
+          command[0] === 'sh' &&
+          String(command[2]).includes('tar xf -')
+        ) {
+          if (pushFailuresLeft > 0) {
+            pushFailuresLeft--
+            callback({ status: 'Failure' })
+            return Promise.resolve()
+          }
+          if (behavior.neverExtract) {
+            // Pod claims success but nothing lands on disk: the case that
+            // used to pass silently and produce an empty workspace.
+            callback({ status: 'Success' })
+            return Promise.resolve()
+          }
+          await new Promise<void>((resolve, reject) => {
+            const extract = tar.extract(podSideDir)
+            stdin!.pipe(extract)
+            extract.on('finish', () => resolve())
+            extract.on('error', reject)
+          })
+          callback({ status: 'Success' })
+          return Promise.resolve()
+        }
+        // Hash-verification listing command. Answer from the runner fixture
+        // unless the pod side is deliberately broken.
+        stdout.write(behavior.neverExtract ? '' : listingFor(runnerDir))
+        callback({ status: 'Success' })
+        return Promise.resolve()
+      }
+    )
+  }
+
+  it(
+    'rejects a failing pod-side exec status and retries until the push succeeds',
+    async () => {
+      fs.writeFileSync(path.join(runnerDir, 'retry.txt'), 'retry-me')
+
+      mockExecPodSide({ failPushStatuses: 2 })
+
+      await execCpToPod('test-pod', runnerDir, CONTAINER_PATH)
+
+      const pushCalls = execSpy.mock.calls.filter(
+        call =>
+          (call[3] as string[])[0] === 'sh' &&
+          String((call[3] as string[])[2]).includes('tar xf -')
+      )
+      // Two rejections must have triggered two retries before the success.
+      expect(pushCalls.length).toBeGreaterThanOrEqual(3)
+      expect(
+        fs.readFileSync(path.join(podSideDir, 'retry.txt'), 'utf8')
+      ).toBe('retry-me')
+    },
+    15000
+  )
+
+  it(
+    'throws when the listing verification never converges',
+    async () => {
+      fs.writeFileSync(path.join(runnerDir, 'content.txt'), 'real content')
+
+      // A pod that reports Success but never materializes the files: this
+      // used to pass silently and leave an empty workspace downstream.
+      mockExecPodSide({ neverExtract: true })
+
+      await expect(
+        execCpToPod('test-pod', runnerDir, CONTAINER_PATH)
+      ).rejects.toThrow(/did not converge/)
+    },
+    30000
+  )
 })

@@ -577,6 +577,66 @@ export async function localCalculateOutputHashSorted(
   )
 }
 
+// Patterns in pod-side tar stderr that mark a REAL extraction failure —
+// bad archive data, IO errors, unrecognized options — as opposed to the
+// metadata-only failures tolerated below. Compared case-insensitively:
+// GNU tar and busybox tar capitalize their messages differently, and a
+// corrupt archive shows up as either "unexpected EOF" or "does not look
+// like a tar archive" depending on where the damage is.
+const TAR_FATAL_STDERR_PATTERN =
+  'Cannot read|unexpected|unrecognized|No such|short read|Cannot open|EOF|does not look like a tar archive'
+
+// Builds the pod-side `sh -c` script that extracts the archive arriving on
+// stdin into `containerPath` and fixes up permissions. Shared by the exec
+// fallback and the direct to-pod script so the stderr classification and
+// the chmod/sync steps cannot drift apart.
+//
+// Failure handling: a failed tar must not be masked by the trailing
+// `sync || true`. But the failure is only fatal when the DATA is bad: on
+// real clusters the job container extracts into the /__w mount point as a
+// non-root user and tar exits non-zero AFTER a complete extraction because
+// it cannot restore the mount point's own metadata (utime/chmod EPERM).
+// The stderr blocklist treats IO/data/option errors as fatal — surfacing
+// tar's stderr through the exec channel before exiting — while tolerating
+// the metadata-only failures; the listing verification still proves the
+// content. Only --no-same-owner is assumed because the job image may ship
+// busybox tar.
+//
+// The stderr goes to /tmp/.hooks-tar.err so fatal vs tolerated can be told
+// apart. A job container with readOnlyRootFilesystem has no writable /tmp:
+// that redirection would fail before tar even runs and break workflows
+// that worked with plain 2>/dev/null, so the script probes writability
+// first and falls back to discarding stderr entirely — all non-zero exits
+// are then tolerated and the listing verification throw is the safety net.
+// `stdinRedirect` is '' when the archive arrives on the exec stdin pipe or
+// '<&3' on the direct channel.
+export function podExtractScript(
+  containerPath: string,
+  stdinRedirect: string
+): string {
+  const errFile = '/tmp/.hooks-tar.err'
+  const stdinPart = stdinRedirect ? ` ${stdinRedirect}` : ''
+  const tarCommand = `tar xf - --no-same-owner -C ${shlex.quote(containerPath)}${stdinPart}`
+  const fixup =
+    `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
+    `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
+    `sync 2>/dev/null || true`
+  return (
+    // A subshell probe: a read-only rootfs fails the redirection inside
+    // the subshell only, and the outer script keeps running.
+    `if (true 2>${errFile}) 2>/dev/null; then\n` +
+    `${tarCommand} 2>${errFile} || { ` +
+    `if grep -qEi '${TAR_FATAL_STDERR_PATTERN}' ${errFile} 2>/dev/null; then ` +
+    // Surface tar's stderr with the failure before removing the file:
+    // a bare exit code is not enough to debug a broken transfer.
+    `echo 'tar extraction failed:' >&2; cat ${errFile} >&2; rm -f ${errFile}; exit 1; fi; rm -f ${errFile}; }\n` +
+    `else\n` +
+    `${tarCommand} 2>/dev/null || true\n` +
+    `fi\n` +
+    fixup
+  )
+}
+
 export async function execCpToPod(
   podName: string,
   runnerPath: string,
@@ -614,29 +674,11 @@ export async function execCpToPod(
       if (!directSucceeded) {
         const exec = new k8s.Exec(kc)
         // Use tar to extract with --no-same-owner to avoid ownership issues.
-        // Then use find to fix permissions.
-        //
-        // A failed tar must not be masked: without the exit-code check a torn
-        // stream leaves a partial extraction behind unnoticed. But the
-        // failure is only fatal when the DATA is bad: on real clusters the
-        // job container extracts into the /__w mount point as a non-root
-        // user, and tar exits non-zero AFTER a complete extraction because
-        // it cannot restore the mount point's own metadata (utime/chmod
-        // EPERM). The root directory's entry is the only thing that failed,
-        // so the listing verification below still proves the content. The
-        // stderr blocklist treats IO/data/option errors as fatal while
-        // tolerating metadata-only failures; the image may ship GNU tar or
-        // busybox tar, so only --no-same-owner is assumed.
-        const command = [
-          'sh',
-          '-c',
-          `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/tmp/.hooks-tar.err || { ` +
-            `if grep -qE 'Cannot read|unexpected|unrecognized|No such|short read|Cannot open|EOF' /tmp/.hooks-tar.err 2>/dev/null; then ` +
-            `rm -f /tmp/.hooks-tar.err; exit 1; fi; rm -f /tmp/.hooks-tar.err; }; ` +
-            `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
-            `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
-            `sync 2>/dev/null || true`
-        ]
+        // Then use find to fix permissions. The extraction script is shared
+        // with the direct to-pod path (podExtractScript) so the tar failure
+        // classification — fatal data/IO errors vs tolerated mount-point
+        // metadata failures — and the read-only-rootfs fallback stay in sync.
+        const command = ['sh', '-c', podExtractScript(containerPath, '')]
         const readStream = tar.pack(runnerPath)
         const errStream = new WritableStreamBuffer()
         await new Promise((resolve, reject) => {
@@ -1741,20 +1783,13 @@ async function transferTarToPodDirectOnce(
       const script =
         `exec 3<>/dev/tcp/${devTcpAddress(listenAddress)}/${port} || exit 1\n` +
         `printf '%s\\n' ${shQuote(transferToken)} >&3\n` +
-        // A failed extraction must not be masked by the trailing `sync || true`:
-        // exiting non-zero surfaces the failure through the exec status, so the
-        // caller falls back to the exec channel instead of trusting a torn copy.
-        // Metadata-only failures on the /__w mount point (utime/chmod EPERM
-        // for the non-root runner user, after a COMPLETE extraction) are
-        // tolerated; the blocklist is the same as the exec fallback path —
-        // see that comment. Only --no-same-owner is assumed because the job
-        // image may ship busybox tar instead of GNU tar.
-        `tar xf - --no-same-owner -C ${shQuote(containerPath)} <&3 2>/tmp/.hooks-tar.err || { ` +
-        `if grep -qE 'Cannot read|unexpected|unrecognized|No such|short read|Cannot open|EOF' /tmp/.hooks-tar.err 2>/dev/null; then ` +
-        `rm -f /tmp/.hooks-tar.err; exit 1; fi; rm -f /tmp/.hooks-tar.err; }; ` +
-        `find ${shQuote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
-        `find ${shQuote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
-        `sync 2>/dev/null || true`
+        // A failed extraction must not be masked: exiting non-zero surfaces
+        // the failure through the exec status, so the caller falls back to
+        // the exec channel instead of trusting a torn copy. The extraction
+        // part is shared with the exec fallback path (podExtractScript) so
+        // the fatal-vs-tolerated stderr classification and the read-only
+        // rootfs fallback cannot drift apart.
+        podExtractScript(containerPath, '<&3')
 
       const errStream = new WritableStreamBuffer()
       new k8s.Exec(kc)
